@@ -1,23 +1,26 @@
 """
 R Cafe 开放点单服务主程序 (FastAPI)
-支持：
-1. 局域网/公网响应式 Web 点单界面
-2. 飞书多维表格 / 自定义 Webhook 自动化点单
+包含：
+1. 响应式 Web 点单界面 + 实时进度轮询（排队 -> 制作中 -> 待取餐 -> 已完成）
+2. 本地历史订单追踪（关闭网页后重新打开仍能查询）
+3. 飞书多维表格 / 自定义 Webhook 自动化点单
+4. 可选：飞书群机器人取餐就绪自动推送
 """
 import os
 import json
-from typing import Optional, Any, Dict
-from fastapi import FastAPI, HTTPException, Request
+import asyncio
+from typing import Optional, Any, Dict, List
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
+import requests
 
 import config
 from coffee_client import RCafeClient, PRESET_PRODUCTS
 
 app = FastAPI(title="R Cafe 开放点单服务")
 
-# 初始化客户端
 client = RCafeClient(
     csrf_token=config.CSRF_TOKEN,
     session_token=config.SESSION_TOKEN,
@@ -25,8 +28,17 @@ client = RCafeClient(
     web_did=config.WEB_DID
 )
 
-# 内存单日点单计数
 daily_orders_cache: Dict[str, int] = {}
+STATUS_MAP = {
+    "pending": {"text": "待制作", "color": "#E67E22", "desc": "订单已提交，吧台排队中..."},
+    "making": {"text": "制作中", "color": "#2F6FED", "desc": "咖啡师正在制作您的饮品..."},
+    "ready": {"text": "待取餐（餐好）", "color": "#27AE60", "desc": "🎉 咖啡已做好，请前往吧台领取！"},
+    "completed": {"text": "已完成", "color": "#646A73", "desc": "已核销取餐"},
+    "cancelled": {"text": "已取消", "color": "#E5484D", "desc": "订单已取消，R豆已原路退回"}
+}
+
+# 缓存已通知过的订单ID，避免飞书群重复提醒
+notified_ready_orders = set()
 
 class OrderSubmitReq(BaseModel):
     user_name: str
@@ -59,7 +71,57 @@ def get_service_info():
 def get_my_orders():
     """获取最新点单列表与取餐状态"""
     try:
-        return client.get_my_orders()
+        data = client.get_my_orders()
+        # 补充易读的状态中文
+        for item in data.get("items", []):
+            st = item.get("status", "unknown")
+            info = STATUS_MAP.get(st, {"text": st, "color": "#888", "desc": ""})
+            item["statusText"] = info["text"]
+            item["statusColor"] = info["color"]
+            item["statusDesc"] = info["desc"]
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/order/status")
+def get_order_status(order_no: Optional[str] = None, pickup_no: Optional[str] = None, user_name: Optional[str] = None):
+    """
+    单单查询或按姓名查询最新订单进度
+    """
+    try:
+        data = client.get_my_orders()
+        items = data.get("items", [])
+        
+        target_order = None
+        for item in items:
+            if order_no and item.get("orderNo") == order_no:
+                target_order = item
+                break
+            if pickup_no and item.get("pickupNo") == pickup_no:
+                target_order = item
+                break
+            if user_name and user_name in (item.get("remark") or ""):
+                target_order = item
+                break
+
+        if not target_order:
+            return {"found": False, "message": "未查询到对应订单"}
+
+        st = target_order.get("status", "unknown")
+        info = STATUS_MAP.get(st, {"text": st, "color": "#888", "desc": ""})
+        return {
+            "found": True,
+            "orderNo": target_order.get("orderNo"),
+            "pickupNo": target_order.get("pickupNo"),
+            "status": st,
+            "statusText": info["text"],
+            "statusColor": info["color"],
+            "statusDesc": info["desc"],
+            "isReady": st in ("ready", "completed"),
+            "remark": target_order.get("remark"),
+            "items": target_order.get("items", [])
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -74,7 +136,6 @@ def submit_order_web(order: OrderSubmitReq):
     if not user_name:
         raise HTTPException(status_code=400, detail="请输入您的姓名或花名")
 
-    # 风控限制
     user_count = daily_orders_cache.get(user_name, 0)
     if user_count >= config.MAX_ORDERS_PER_PERSON_DAILY:
         raise HTTPException(status_code=400, detail=f"您今日点单已达上限（{config.MAX_ORDERS_PER_PERSON_DAILY}杯）")
@@ -101,14 +162,7 @@ def submit_order_web(order: OrderSubmitReq):
 @app.post("/api/feishu/webhook")
 @app.post("/webhook")
 async def handle_feishu_webhook(request: Request):
-    """
-    飞书多维表格表单 / 自动化 Webhook 专用接口
-    支持常见的字段映射：
-    - user_name / 姓名 / 点单人 / 同事
-    - product / 饮品 / 品类 / 咖啡 / 商品
-    - temp / 冷热 / 温度 / 规格
-    - remark / 备注 / 说明
-    """
+    """飞书多维表格表单 / 自动化 Webhook 专用接口"""
     if not config.ALLOW_ORDERING:
         return JSONResponse(status_code=400, content={"error": "服务当前已暂停接单"})
 
@@ -117,22 +171,19 @@ async def handle_feishu_webhook(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="请求体必须为合法 JSON")
 
-    # 兼容飞书多维表格记录结构 (可能嵌套在 fields 字典内)
     data = body.get("fields", body) if isinstance(body, dict) else {}
 
-    # 提取姓名
     user_name = (
         data.get("user_name") or data.get("姓名") or data.get("点单人") or
         data.get("同事") or data.get("name") or ""
     )
-    if isinstance(user_name, list) and user_name:  # 飞书人员字段可能为列表
+    if isinstance(user_name, list) and user_name:
         user_name = user_name[0].get("name", "") if isinstance(user_name[0], dict) else str(user_name[0])
 
     user_name = str(user_name).strip()
     if not user_name:
         return JSONResponse(status_code=400, content={"error": "缺少点单人姓名字段（如 '姓名' 或 'user_name'）"})
 
-    # 提取饮品
     product = (
         data.get("product") or data.get("饮品") or data.get("品类") or
         data.get("咖啡") or data.get("商品") or "拿铁"
@@ -141,7 +192,6 @@ async def handle_feishu_webhook(request: Request):
         product = product[0]
     product = str(product).strip()
 
-    # 提取温度
     temp = (
         data.get("temp") or data.get("冷热") or data.get("温度") or
         data.get("规格") or "热饮"
@@ -150,12 +200,10 @@ async def handle_feishu_webhook(request: Request):
         temp = temp[0]
     temp = str(temp).strip()
 
-    # 提取备注
     remark = data.get("remark") or data.get("备注") or data.get("说明") or None
     if remark:
         remark = str(remark).strip()
 
-    # 风控限制
     user_count = daily_orders_cache.get(user_name, 0)
     if user_count >= config.MAX_ORDERS_PER_PERSON_DAILY:
         return JSONResponse(
@@ -171,8 +219,6 @@ async def handle_feishu_webhook(request: Request):
             extra_remark=remark
         )
         daily_orders_cache[user_name] = user_count + 1
-        
-        # 返回取餐码等详细信息，方便飞书自动化工作流提取并回写表格
         return {
             "status": "success",
             "code": 0,
@@ -188,7 +234,7 @@ async def handle_feishu_webhook(request: Request):
 
 @app.get("/", response_class=HTMLResponse)
 def index_html():
-    """现代化响应式点单前台"""
+    """现代化响应式点单前台（含实时制作进度轮询与历史订单卡片）"""
     return """
     <!DOCTYPE html>
     <html lang="zh-CN">
@@ -212,47 +258,60 @@ def index_html():
                 background-color: var(--bg);
                 color: var(--text-main);
                 margin: 0;
-                padding: 20px 16px;
+                padding: 16px;
                 display: flex;
                 justify-content: center;
             }
             .container {
-                max-width: 460px;
+                max-width: 480px;
                 width: 100%;
             }
             .brand-header {
                 text-align: center;
-                margin-bottom: 20px;
+                margin-bottom: 16px;
             }
             .brand-title {
                 font-size: 24px;
                 font-weight: 700;
                 color: var(--primary);
-                margin: 0 0 6px 0;
+                margin: 0 0 4px 0;
             }
             .brand-sub {
                 font-size: 13px;
                 color: var(--text-sub);
             }
-            .badge-status {
-                display: inline-block;
-                margin-top: 8px;
-                background: var(--primary-light);
-                color: #2E7D32;
-                font-size: 13px;
-                font-weight: 500;
-                padding: 4px 12px;
-                border-radius: 20px;
+            .nav-tabs {
+                display: flex;
+                background: #E5E9ED;
+                border-radius: 10px;
+                padding: 3px;
+                margin-bottom: 16px;
+            }
+            .nav-tab {
+                flex: 1;
+                text-align: center;
+                padding: 8px;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+                border-radius: 8px;
+                color: var(--text-sub);
+                transition: all 0.2s;
+            }
+            .nav-tab.active {
+                background: #FFF;
+                color: var(--primary);
+                box-shadow: 0 2px 6px rgba(0,0,0,0.08);
             }
             .card {
                 background: var(--card);
                 border-radius: 16px;
-                padding: 24px;
+                padding: 22px;
                 box-shadow: 0 4px 20px rgba(0, 0, 0, 0.05);
                 margin-bottom: 16px;
             }
             .form-item {
-                margin-bottom: 18px;
+                margin-bottom: 16px;
             }
             .form-label {
                 display: block;
@@ -262,12 +321,11 @@ def index_html():
             }
             input[type="text"] {
                 width: 100%;
-                padding: 13px 14px;
+                padding: 12px 14px;
                 border: 1.5px solid var(--border);
                 border-radius: 10px;
                 font-size: 15px;
                 outline: none;
-                transition: border-color 0.2s;
             }
             input[type="text"]:focus {
                 border-color: var(--primary);
@@ -278,13 +336,12 @@ def index_html():
                 gap: 10px;
             }
             .opt-btn {
-                padding: 14px;
+                padding: 12px;
                 border: 1.5px solid var(--border);
                 background: #FFF;
                 border-radius: 10px;
                 text-align: center;
                 cursor: pointer;
-                transition: all 0.2s;
             }
             .opt-btn .title {
                 font-size: 15px;
@@ -305,7 +362,7 @@ def index_html():
             }
             .submit-btn {
                 width: 100%;
-                padding: 15px;
+                padding: 14px;
                 background: var(--primary);
                 color: #FFF;
                 border: none;
@@ -314,38 +371,95 @@ def index_html():
                 font-weight: 600;
                 cursor: pointer;
                 box-shadow: 0 4px 12px rgba(0, 112, 74, 0.25);
-                margin-top: 10px;
             }
             .submit-btn:disabled {
                 background: #99C7B6;
                 cursor: not-allowed;
                 box-shadow: none;
             }
-            .result-card {
-                display: none;
-                background: #F0FDF4;
-                border: 1.5px solid #BBF7D0;
+            /* 实时进度卡片 */
+            .status-banner {
                 border-radius: 14px;
-                padding: 20px;
+                padding: 16px;
                 margin-top: 16px;
                 text-align: center;
+                display: none;
             }
-            .pickup-label {
+            .status-banner.making {
+                background: #EFF6FF;
+                border: 1.5px solid #BFDBFE;
+            }
+            .status-banner.ready {
+                background: #F0FDF4;
+                border: 2px solid #22C55E;
+                animation: pulse 1.8s infinite;
+            }
+            @keyframes pulse {
+                0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4); }
+                70% { box-shadow: 0 0 0 10px rgba(34, 197, 94, 0); }
+                100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+            }
+            .pickup-badge-title {
                 font-size: 13px;
-                color: #166534;
+                font-weight: 600;
+            }
+            .pickup-code-lg {
+                font-size: 42px;
+                font-weight: 800;
+                margin: 6px 0;
+                letter-spacing: 2px;
+            }
+            .stepper {
+                display: flex;
+                justify-content: space-between;
+                margin: 16px 0 8px 0;
+                position: relative;
+            }
+            .step-item {
+                flex: 1;
+                text-align: center;
+                font-size: 12px;
+                color: #999;
                 font-weight: 500;
             }
-            .pickup-num {
-                font-size: 38px;
-                font-weight: 800;
+            .step-item.active {
                 color: var(--primary);
-                letter-spacing: 1px;
-                margin: 8px 0;
+                font-weight: 700;
             }
-            .pickup-desc {
-                font-size: 13px;
-                color: #4B5563;
-                line-height: 1.5;
+            .step-circle {
+                width: 22px;
+                height: 22px;
+                border-radius: 50%;
+                background: #E5E7EB;
+                color: #666;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                margin: 0 auto 4px auto;
+                font-size: 11px;
+            }
+            .step-item.active .step-circle {
+                background: var(--primary);
+                color: #FFF;
+            }
+            .order-item-card {
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 14px;
+                margin-bottom: 12px;
+                background: #FFF;
+            }
+            .order-top {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 6px;
+            }
+            .status-tag {
+                padding: 3px 8px;
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: 600;
             }
         </style>
     </head>
@@ -353,62 +467,126 @@ def index_html():
         <div class="container">
             <div class="brand-header">
                 <div class="brand-title">☕ R Café 点单通道</div>
-                <div class="brand-sub">欢迎同事点单 · 自动写入备注</div>
-                <div class="badge-status" id="statusBadge">服务在线 · 余额充足</div>
+                <div class="brand-sub">姓名自动上贴 · 实时查询制作进度</div>
             </div>
 
-            <div class="card">
-                <div class="form-item">
-                    <label class="form-label">您的姓名 / 花名 <span style="color:#E5484D">*</span></label>
-                    <input type="text" id="userName" placeholder="姓名将直接打印在杯贴备注上" required>
-                </div>
+            <!-- Tab 切换 -->
+            <div class="nav-tabs">
+                <div class="nav-tab active" id="tabOrder" onclick="switchTab('order')">我要点单</div>
+                <div class="nav-tab" id="tabStatus" onclick="switchTab('status')">点单进度 / 记录</div>
+            </div>
 
-                <div class="form-item">
-                    <label class="form-label">选择咖啡</label>
-                    <div class="grid-options">
-                        <div class="opt-btn active" onclick="setProduct('latte', this)">
-                            <div class="title">拿铁</div>
-                            <div class="sub">6.9 R豆</div>
+            <!-- Tab 1: 点单面板 -->
+            <div id="panelOrder">
+                <div class="card">
+                    <div class="form-item">
+                        <label class="form-label">您的姓名 / 花名 <span style="color:#E5484D">*</span></label>
+                        <input type="text" id="userName" placeholder="姓名将直接打印在杯贴上" required>
+                    </div>
+
+                    <div class="form-item">
+                        <label class="form-label">选择咖啡</label>
+                        <div class="grid-options">
+                            <div class="opt-btn active" onclick="setProduct('latte', this)">
+                                <div class="title">拿铁</div>
+                                <div class="sub">6.9 R豆</div>
+                            </div>
+                            <div class="opt-btn" onclick="setProduct('americano', this)">
+                                <div class="title">美式咖啡</div>
+                                <div class="sub">4.9 R豆</div>
+                            </div>
                         </div>
-                        <div class="opt-btn" onclick="setProduct('americano', this)">
-                            <div class="title">美式咖啡</div>
-                            <div class="sub">4.9 R豆</div>
+                    </div>
+
+                    <div class="form-item">
+                        <label class="form-label">温度规格</label>
+                        <div class="grid-options">
+                            <div class="opt-btn active" onclick="setTemp('热饮', this)">
+                                <div class="title">热饮</div>
+                                <div class="sub">中杯 / 无糖</div>
+                            </div>
+                            <div class="opt-btn" onclick="setTemp('冰饮', this)">
+                                <div class="title">冰饮</div>
+                                <div class="sub">中杯 / 无糖</div>
+                            </div>
                         </div>
+                    </div>
+
+                    <div class="form-item">
+                        <label class="form-label">额外备注（选填）</label>
+                        <input type="text" id="remark" placeholder="如：少冰、稍后做等">
+                    </div>
+
+                    <button class="submit-btn" id="submitBtn" onclick="doSubmit()">立即下单</button>
+                </div>
+            </div>
+
+            <!-- Tab 2: 进度 / 记录面板 -->
+            <div id="panelStatus" style="display: none;">
+                <div class="card" style="margin-bottom: 12px; padding: 16px;">
+                    <div style="font-size: 14px; font-weight: 600; margin-bottom: 8px;">快速查询我的点单</div>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="text" id="queryName" placeholder="输入姓名或取餐码查询" style="flex: 1;">
+                        <button onclick="queryMyOrders()" style="padding: 0 16px; background: var(--primary); color: #FFF; border: none; border-radius: 8px; font-weight: 600; cursor: pointer;">查询</button>
                     </div>
                 </div>
 
-                <div class="form-item">
-                    <label class="form-label">温度规格</label>
-                    <div class="grid-options">
-                        <div class="opt-btn active" onclick="setTemp('热饮', this)">
-                            <div class="title">热饮</div>
-                            <div class="sub">中杯 / 无糖</div>
-                        </div>
-                        <div class="opt-btn" onclick="setTemp('冰饮', this)">
-                            <div class="title">冰饮</div>
-                            <div class="sub">中杯 / 无糖</div>
-                        </div>
-                    </div>
+                <div id="ordersList">
+                    <div style="text-align: center; color: #888; font-size: 13px; padding: 20px;">正在加载订单进度...</div>
                 </div>
+            </div>
 
-                <div class="form-item">
-                    <label class="form-label">额外备注（选填）</label>
-                    <input type="text" id="remark" placeholder="例如：少冰、稍后做等">
+            <!-- 动态弹出的即时状态卡片（在点单面板下方展示） -->
+            <div class="status-banner" id="liveStatusCard">
+                <div class="pickup-badge-title" id="bannerTitle">订单提交中...</div>
+                <div class="pickup-code-lg" id="bannerPickupNo">----</div>
+                <div id="bannerStatusText" style="font-size: 16px; font-weight: 700; margin-bottom: 6px;"></div>
+                <div id="bannerDesc" style="font-size: 13px; color: #555;"></div>
+
+                <!-- 进度条 -->
+                <div class="stepper">
+                    <div class="step-item" id="step1"><div class="step-circle">1</div>待制作</div>
+                    <div class="step-item" id="step2"><div class="step-circle">2</div>制作中</div>
+                    <div class="step-item" id="step3"><div class="step-circle">3</div>餐好待取</div>
+                    <div class="step-item" id="step4"><div class="step-circle">4</div>已取餐</div>
                 </div>
-
-                <button class="submit-btn" id="submitBtn" onclick="doSubmit()">立即下单</button>
-
-                <div class="result-card" id="resultCard">
-                    <div class="pickup-label">🎉 点单成功！请凭此取餐号取餐：</div>
-                    <div class="pickup-num" id="pickupNo">----</div>
-                    <div class="pickup-desc" id="pickupDetail"></div>
-                </div>
+                <div style="font-size: 12px; color: #888; margin-top: 10px;">⚡ 页面每 8 秒自动刷新状态，做好了将变绿提醒</div>
             </div>
         </div>
 
         <script>
             let selectedProduct = 'latte';
             let selectedTemp = '热饮';
+            let activeOrderNo = localStorage.getItem('last_order_no') || null;
+            let activePickupNo = localStorage.getItem('last_pickup_no') || null;
+            let pollingTimer = null;
+
+            // 页面初始化恢复已存姓名
+            const savedName = localStorage.getItem('coffee_user_name');
+            if (savedName) {
+                document.getElementById('userName').value = savedName;
+                document.getElementById('queryName').value = savedName;
+            }
+
+            // 如果有尚未完成的活跃订单，自动轮询它
+            if (activeOrderNo) {
+                startPollingStatus(activeOrderNo, activePickupNo);
+            }
+
+            function switchTab(tab) {
+                if (tab === 'order') {
+                    document.getElementById('tabOrder').classList.add('active');
+                    document.getElementById('tabStatus').classList.remove('active');
+                    document.getElementById('panelOrder').style.display = 'block';
+                    document.getElementById('panelStatus').style.display = 'none';
+                } else {
+                    document.getElementById('tabStatus').classList.add('active');
+                    document.getElementById('tabOrder').classList.remove('active');
+                    document.getElementById('panelOrder').style.display = 'none';
+                    document.getElementById('panelStatus').style.display = 'block';
+                    queryMyOrders();
+                }
+            }
 
             function setProduct(p, el) {
                 selectedProduct = p;
@@ -426,7 +604,6 @@ def index_html():
                 const name = document.getElementById('userName').value.trim();
                 const remark = document.getElementById('remark').value.trim();
                 const btn = document.getElementById('submitBtn');
-                const card = document.getElementById('resultCard');
 
                 if (!name) {
                     alert('请输入您的姓名或花名！');
@@ -434,9 +611,9 @@ def index_html():
                     return;
                 }
 
+                localStorage.setItem('coffee_user_name', name);
                 btn.disabled = true;
                 btn.innerText = '正在提交订单...';
-                card.style.display = 'none';
 
                 try {
                     const res = await fetch('/api/order', {
@@ -452,17 +629,119 @@ def index_html():
                     const data = await res.json();
                     if (!res.ok) throw new Error(data.detail || data.error || '下单失败');
 
-                    card.style.display = 'block';
-                    document.getElementById('pickupNo').innerText = data.pickupNo;
-                    document.getElementById('pickupDetail').innerHTML = `
-                        <b>${data.colleague}</b> 点的 <b>${data.productName} (${data.temp})</b><br>
-                        备注：${data.remark} · 扣除 ${data.cost} R豆
-                    `;
+                    activeOrderNo = data.orderNo;
+                    activePickupNo = data.pickupNo;
+                    localStorage.setItem('last_order_no', activeOrderNo);
+                    localStorage.setItem('last_pickup_no', activePickupNo);
+
+                    startPollingStatus(activeOrderNo, activePickupNo);
                 } catch (e) {
                     alert('下单失败: ' + e.message);
                 } finally {
                     btn.disabled = false;
                     btn.innerText = '立即下单';
+                }
+            }
+
+            function startPollingStatus(orderNo, pickupNo) {
+                const banner = document.getElementById('liveStatusCard');
+                banner.style.display = 'block';
+                document.getElementById('bannerPickupNo').innerText = pickupNo || '----';
+
+                if (pollingTimer) clearInterval(pollingTimer);
+                checkStatus(orderNo, pickupNo);
+                pollingTimer = setInterval(() => checkStatus(orderNo, pickupNo), 8000);
+            }
+
+            async function checkStatus(orderNo, pickupNo) {
+                try {
+                    const res = await fetch(`/api/order/status?order_no=${encodeURIComponent(orderNo)}&pickup_no=${encodeURIComponent(pickupNo)}`);
+                    const data = await res.json();
+                    if (!data.found) return;
+
+                    const banner = document.getElementById('liveStatusCard');
+                    const textEl = document.getElementById('bannerStatusText');
+                    const descEl = document.getElementById('bannerDesc');
+                    const titleEl = document.getElementById('bannerTitle');
+
+                    textEl.innerText = data.statusText;
+                    textEl.style.color = data.statusColor;
+                    descEl.innerText = data.statusDesc;
+
+                    // 重置步骤样式
+                    ['step1', 'step2', 'step3', 'step4'].forEach(id => document.getElementById(id).classList.remove('active'));
+
+                    if (data.status === 'pending') {
+                        banner.className = 'status-banner making';
+                        titleEl.innerText = '⏳ 订单已提交，排队中...';
+                        document.getElementById('step1').classList.add('active');
+                    } else if (data.status === 'making') {
+                        banner.className = 'status-banner making';
+                        titleEl.innerText = '👨‍🍳 咖啡师正在制作中...';
+                        document.getElementById('step1').classList.add('active');
+                        document.getElementById('step2').classList.add('active');
+                    } else if (data.status === 'ready') {
+                        banner.className = 'status-banner ready';
+                        titleEl.innerText = '🔔 咖啡做好了！请前往吧台领取';
+                        document.getElementById('step1').classList.add('active');
+                        document.getElementById('step2').classList.add('active');
+                        document.getElementById('step3').classList.add('active');
+                    } else if (data.status === 'completed') {
+                        banner.className = 'status-banner';
+                        titleEl.innerText = '✅ 订单已完成取餐';
+                        document.getElementById('step1').classList.add('active');
+                        document.getElementById('step2').classList.add('active');
+                        document.getElementById('step3').classList.add('active');
+                        document.getElementById('step4').classList.add('active');
+                        clearInterval(pollingTimer);
+                    }
+                } catch(e) {
+                    console.log('轮询状态异常', e);
+                }
+            }
+
+            async function queryMyOrders() {
+                const keyword = document.getElementById('queryName').value.trim();
+                const listEl = document.getElementById('ordersList');
+                listEl.innerHTML = '<div style="text-align:center; color:#888; padding:20px;">正在获取订单列表...</div>';
+
+                try {
+                    const res = await fetch('/api/orders/my');
+                    const data = await res.json();
+                    const items = data.items || [];
+
+                    let filtered = items;
+                    if (keyword) {
+                        filtered = items.filter(it => 
+                            (it.remark && it.remark.includes(keyword)) ||
+                            it.pickupNo === keyword ||
+                            it.orderNo === keyword
+                        );
+                    }
+
+                    if (filtered.length === 0) {
+                        listEl.innerHTML = `<div style="text-align:center; color:#888; padding:30px;">未找到与 "${keyword}" 相关的订单</div>`;
+                        return;
+                    }
+
+                    let html = '';
+                    filtered.slice(0, 15).forEach(it => {
+                        const productInfo = it.items && it.items[0] ? `${it.items[0].productName} (${it.items[0].specInfo || ''})` : '咖啡';
+                        html += `
+                        <div class="order-item-card">
+                            <div class="order-top">
+                                <span style="font-size: 20px; font-weight: 800; color: var(--primary);">取餐号: ${it.pickupNo}</span>
+                                <span class="status-tag" style="background: ${it.statusColor}20; color: ${it.statusColor};">${it.statusText}</span>
+                            </div>
+                            <div style="font-size: 14px; font-weight: 600; margin-bottom: 4px;">${productInfo}</div>
+                            <div style="font-size: 12px; color: #555;">${it.remark || '无备注'}</div>
+                            <div style="font-size: 11px; color: #999; margin-top: 6px;">下单时间: ${new Date(it.createdAt).toLocaleTimeString()} · 状态: ${it.statusDesc}</div>
+                        </div>
+                        `;
+                    });
+                    listEl.innerHTML = html;
+                } catch (e) {
+                    listEl.innerHTML = `<div style="color:red; text-align:center; padding:20px;">加载失败: ${e.message}</div>`;
                 }
             }
         </script>
