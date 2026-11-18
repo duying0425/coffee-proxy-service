@@ -3,10 +3,10 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg?style=flat&logo=FastAPI&logoColor=white)](https://fastapi.tiangolo.com)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB.svg?style=flat&logo=Python&logoColor=white)](https://www.python.org/)
 [![Nginx](https://img.shields.io/badge/Nginx-Reverse%20Proxy-009639.svg?style=flat&logo=Nginx&logoColor=white)](https://nginx.org/)
-[![License](https://img.shields.io/badge/License-Internal%20Use-blue.svg)](#)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](#)
 
-> 为公司内部飞书企业应用（ReachAuto R Café）量身打造的点单中继代理与自动化服务。  
-> 破解与封装底层下单协议，允许同事在无需拥有个人 R 豆账户的情况下自助点单，**并将点单人姓名自动打印在咖啡杯贴备注上**。
+> 为企业内部飞书企业应用（R Café）量身打造的点单中继代理与自动化服务。  
+> 破解与封装底层下单协议，允许同事在无需拥有个人咖啡账户/余额的情况下自助点单，**并将点单人姓名自动打印在咖啡杯贴备注上**。
 
 ---
 
@@ -48,7 +48,7 @@
 
 | 体验维度 | 通道一：飞书多维表格（实名点单） ⭐ *推荐* | 通道二：Web 点单端（花名/匿名） |
 | :--- | :--- | :--- |
-| **入口地址** | [飞书自助点单问卷](https://reachauto.feishu.cn/share/base/form/shrcn2SzTgUb8yjIVE81vOPqkbb) | [https://cafe.tmhcorps.cn](https://cafe.tmhcorps.cn) |
+| **入口地址** | 飞书自助点单问卷 / 表单 | `https://cafe.example.com`（Web 门户） |
 | **适用场景** | 想要省心、不愿一直盯着网页的同事 | 喜欢用花名/外号、临时即开即用的同事 |
 | **姓名录入** | 飞书员工账号自动关联 | 自由输入姓名或花名 |
 | **取餐通知** | **飞书私信强弹窗**（制作完成瞬间飞书推送取餐码卡片） | **网页看板自查**（点单后显示动态进度条，支持实时搜索） |
@@ -74,7 +74,7 @@
              (姓名含测试/DRY_RUN)             (构造请求 & 写入点单人备注)
                       │                                 │
                       ▼                                 ▼
-             模拟 10 秒后就绪              ReachAuto R Café 官方接口 (扣豆)
+             模拟 10 秒后就绪               R Café 官方秒搭接口 (扣豆)
                       │                                 │
                       └────────────────┬────────────────┘
                                        ▼
@@ -120,7 +120,7 @@ cp .env.example .env
 ```
 编辑 `.env` 文件：
 ```ini
-BASE_URL=https://reachauto.feishuapp.com/app/app_17fmvspzbtf
+BASE_URL=https://your-tenant.feishuapp.com/app/your_app_id
 CSRF_TOKEN=your_csrf_token_here
 SESSION_TOKEN=your_session_jwt_here
 WEB_DID=your_web_did_here
@@ -128,8 +128,8 @@ WEB_DID=your_web_did_here
 PORT=8085
 HOST=0.0.0.0
 DRY_RUN=false
-FEISHU_NOTIFY_WEBHOOK=https://reachauto.feishu.cn/base/workflow/webhook/event/xxx
-FEISHU_FORM_URL=https://reachauto.feishu.cn/share/base/form/xxx
+FEISHU_NOTIFY_WEBHOOK=https://your-company.feishu.cn/base/workflow/webhook/event/your_event_id
+FEISHU_FORM_URL=https://your-company.feishu.cn/share/base/form/your_form_token
 ```
 
 ### 4. 启动服务
@@ -142,10 +142,10 @@ python -m uvicorn app:app --host 0.0.0.0 --port 8085 --reload
 
 ## 🛠️ 生产环境部署与运维
 
-线上服务部署于阿里云 Linux 服务器，采用 **Systemd 守护进程 + Nginx 反向代理 + HTTPS (Cloudflare)** 架构。
+线上推荐采用 **Systemd 守护进程 + Nginx 反向代理 + HTTPS** 架构。
 
 ### 1. Systemd 守护进程
-服务配置文件位于 [cafe-service.service](file:///C:/Users/duyin/.gemini/antigravity/scratch/coffee_service/cafe-service.service)：
+服务配置文件参考 [cafe-service.service](cafe-service.service)：
 ```ini
 [Unit]
 Description=R Cafe Ordering Service for Feishu
@@ -153,12 +153,12 @@ After=network.target
 
 [Service]
 Type=simple
-User=duyingfang
-WorkingDirectory=/home/duyingfang/cafe-service
-ExecStart=/home/duyingfang/cafe-service/venv/bin/python app.py
+User=appuser
+WorkingDirectory=/opt/cafe-service
+ExecStart=/opt/cafe-service/venv/bin/python app.py
 Restart=always
 RestartSec=5
-EnvironmentFile=/home/duyingfang/cafe-service/.env
+EnvironmentFile=/opt/cafe-service/.env
 
 [Install]
 WantedBy=multi-user.target
@@ -177,15 +177,15 @@ sudo systemctl status cafe-service
 ```
 
 ### 2. Nginx 反向代理配置
-Nginx 配置参考 [nginx.conf](file:///C:/Users/duyin/.gemini/antigravity/scratch/coffee_service/nginx.conf)，转发至本机 `8085` 端口：
+Nginx 配置参考 [nginx.conf](nginx.conf)，转发至本机 `8085` 端口：
 ```nginx
 server {
     listen 80;
     listen 443 ssl;
-    server_name cafe.tmhcorps.cn;
+    server_name cafe.example.com;
 
-    ssl_certificate     /etc/nginx/ssl/selfsigned.crt;
-    ssl_certificate_key /etc/nginx/ssl/selfsigned.key;
+    ssl_certificate     /etc/nginx/ssl/your_cert.crt;
+    ssl_certificate_key /etc/nginx/ssl/your_key.key;
     ssl_protocols       TLSv1.2 TLSv1.3;
 
     charset utf-8;
@@ -219,7 +219,7 @@ server {
 ### 2. 自动化工作流 1：表单提交下单
 1. **触发器**：当添加记录或表单提交时；
 2. **动作 1**：发送 HTTP 请求至代理服务：
-   - URL: `https://cafe.tmhcorps.cn/api/feishu/webhook`
+   - URL: `https://cafe.example.com/api/feishu/webhook`
    - Method: `POST`
    - Body:
      ```json
@@ -247,7 +247,7 @@ server {
 ## 🔌 API 接口规范
 
 ### 1. 服务与状态查询
-* `GET /api/info`：获取服务运行状态、当前账户 R 豆余额、是否处于演练模式、可点商品列表及价格。
+* `GET /api/info`：获取服务运行状态、当前账户余额、是否处于演练模式、可点商品列表及价格。
 * `GET /api/menu`：获取可选饮品与规格选项。
 * `GET /api/orders`：获取当前订单监控列表（包含待制作、制作中、待取餐订单状态）。
 
@@ -283,10 +283,10 @@ server {
 
 ## 🔑 Token 凭证维护指南 (约30天周期)
 
-飞书秒搭应用的登录凭证 `X-Force-Runtime-Session`（JWT 格式）有效期通常在 **30 天左右**。当凭证过期导致点单报错时，请按以下 1 分钟指引更新：
+飞书秒搭应用的登录凭证 `X-Force-Runtime-Session`（JWT 格式）有效期通常在 **30 天左右**。当凭证过期导致点单报错时，请按以下指引更新：
 
 1. **获取最新凭证**：
-   - 电脑浏览器（Edge / Chrome）打开 `https://reachauto.feishuapp.com/app/app_17fmvspzbtf` 并登录；
+   - 电脑浏览器（Edge / Chrome）打开咖啡秒搭应用并登录；
    - 按 `F12` 打开开发者工具，切换到 **网络 (Network)** 面板；
    - 刷新页面，在任意接口请求上右键 -> **复制 (Copy)** -> **复制为 cURL (bash)**。
 2. **提取两个关键参数**：
@@ -294,15 +294,15 @@ server {
    - `X-Force-Runtime-Session: <session_token>`
 3. **更新生产服务器**：
    ```bash
-   ssh aliyun-cf
-   nano /home/duyingfang/cafe-service/.env  # 替换 CSRF_TOKEN 和 SESSION_TOKEN
-   sudo systemctl restart cafe-service      # 重启使新凭证生效
+   ssh your-server
+   nano /opt/cafe-service/.env          # 替换 CSRF_TOKEN 和 SESSION_TOKEN
+   sudo systemctl restart cafe-service  # 重启使新凭证生效
    ```
 4. **验证可用性**：
    ```bash
-   curl -s https://cafe.tmhcorps.cn/api/info | jq .
+   curl -s https://cafe.example.com/api/info | jq .
    ```
-   若 `status` 显示 `"online"` 且正确返回 `rBalance` 余额，即说明 Token 续期成功！
+   若 `status` 显示 `"online"` 且正确返回账户余额，即说明 Token 续期成功！
 
 ---
 

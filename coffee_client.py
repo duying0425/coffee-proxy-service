@@ -4,6 +4,7 @@ R Cafe (飞书秒搭咖啡应用) 客户端核心模块
 import requests
 import json
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 PRESET_PRODUCTS = {
     "americano": {
@@ -37,8 +38,8 @@ PRESET_PRODUCTS = {
 }
 
 class RCafeClient:
-    def __init__(self, csrf_token: str, session_token: str, base_url: str = "https://reachauto.feishuapp.com/app/app_17fmvspzbtf", web_did: str = "1882094366978228"):
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, csrf_token: str, session_token: str, base_url: str = "", web_did: str = "1882094366978228"):
+        self.base_url = base_url.rstrip("/") if base_url else ""
         self.csrf_token = csrf_token
         self.session_token = session_token
         self.web_did = web_did
@@ -46,11 +47,12 @@ class RCafeClient:
 
     @property
     def headers(self) -> Dict[str, str]:
+        page_route = urlparse(self.base_url).path if self.base_url else ""
         return {
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json",
             "referer": self.base_url,
-            "x-page-route": "/app/app_17fmvspzbtf",
+            "x-page-route": page_route,
             "x-suda-csrf-token": self.csrf_token,
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "cookie": f"suda-csrf-token={self.csrf_token}; X-Force-Runtime-Session={self.session_token}; suda_web_did={self.web_did}"

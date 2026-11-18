@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL = os.getenv("BASE_URL", "https://reachauto.feishuapp.com/app/app_17fmvspzbtf")
+BASE_URL = os.getenv("BASE_URL", "")
 CSRF_TOKEN = os.getenv("CSRF_TOKEN", "")
 SESSION_TOKEN = os.getenv("SESSION_TOKEN", "")
 WEB_DID = os.getenv("WEB_DID", "")

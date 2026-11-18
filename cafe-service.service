@@ -4,12 +4,12 @@ After=network.target
 
 [Service]
 Type=simple
-User=duyingfang
-WorkingDirectory=/home/duyingfang/cafe-service
-ExecStart=/home/duyingfang/cafe-service/venv/bin/python app.py
+User=appuser
+WorkingDirectory=/opt/cafe-service
+ExecStart=/opt/cafe-service/venv/bin/python app.py
 Restart=always
 RestartSec=5
-EnvironmentFile=/home/duyingfang/cafe-service/.env
+EnvironmentFile=/opt/cafe-service/.env
 
 [Install]
 WantedBy=multi-user.target
