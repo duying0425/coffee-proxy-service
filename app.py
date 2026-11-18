@@ -1,8 +1,10 @@
 """
 R Cafe 开放点单服务主程序 (FastAPI)
 包含：
-1. 响应式 Web 点单界面 + 实时进度轮询（排队 -> 制作中 -> 待取餐 -> 已完成）
-2. 本地历史订单追踪（关闭网页后重新打开仍能查询）
+1. 双通道点单支持：
+   - 通道一：飞书实名表单（推荐，支持飞书出餐私信强提醒）
+   - 通道二：网页花名点单（支持花名/免登，网页自查制作进度）
+2. 响应式 Web 前台 + 实时进度轮询（排队 -> 制作中 -> 待取餐 -> 已完成）
 3. 飞书多维表格 / 自定义 Webhook 自动化点单
 4. 后台自动巡检与飞书取餐就绪 Webhook 推送
 """
@@ -37,7 +39,6 @@ STATUS_MAP = {
     "cancelled": {"text": "已取消", "color": "#E5484D", "desc": "订单已取消，R豆已原路退回"}
 }
 
-# 记录已推送过通知的订单编号，避免重复提醒
 notified_ready_orders = set()
 
 
@@ -51,7 +52,6 @@ async def order_status_monitor_loop():
     """后台任务：每 15 秒轮询一次，发现订单餐好自动推送飞书 Webhook"""
     print("[Monitor] 启动后台订单状态监听巡检...")
     try:
-        # 先记录下历史已做完的订单，防止重启时重复推送
         init_data = client.get_my_orders()
         for item in init_data.get("items", []):
             if item.get("status") in ("ready", "completed"):
@@ -71,9 +71,7 @@ async def order_status_monitor_loop():
                 order_no = item.get("orderNo")
                 status = item.get("status")
                 
-                # 当订单为 ready（餐好）或刚完成，且尚未推送过时
                 if status in ("ready", "completed") and order_no not in notified_ready_orders:
-                    # 提取同事名字
                     remark = item.get("remark") or ""
                     colleague = "同事"
                     if "点单人:" in remark:
@@ -111,8 +109,8 @@ async def order_status_monitor_loop():
 
 class OrderSubmitReq(BaseModel):
     user_name: str
-    product: str          # 'americano' | 'latte' | '美式' | '拿铁'
-    temp: str             # '热饮' | '冰饮'
+    product: str
+    temp: str
     remark: Optional[str] = None
 
 
@@ -127,6 +125,7 @@ def get_service_info():
             "rBalance": balance.get("rBalance"),
             "allowOrdering": config.ALLOW_ORDERING,
             "maxDailyPerUser": config.MAX_ORDERS_PER_PERSON_DAILY,
+            "feishuFormUrl": config.FEISHU_FORM_URL,
             "products": {
                 k: {"name": v["name"], "price": v["price"]}
                 for k, v in PRESET_PRODUCTS.items()
@@ -300,8 +299,8 @@ async def handle_feishu_webhook(request: Request):
 
 @app.get("/", response_class=HTMLResponse)
 def index_html():
-    """现代化响应式点单前台（含实时制作进度轮询与历史订单卡片）"""
-    return """
+    """现代化响应式点单前台（双通道对比 + 实时制作进度轮询与历史订单卡片）"""
+    return f"""
     <!DOCTYPE html>
     <html lang="zh-CN">
     <head>
@@ -309,17 +308,19 @@ def index_html():
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
         <title>R Café 点单通道</title>
         <style>
-            :root {
+            :root {{
                 --primary: #00704A;
                 --primary-light: #E8F5E9;
+                --feishu-blue: #3370FF;
+                --feishu-light: #EFF4FF;
                 --bg: #F4F6F8;
                 --card: #FFFFFF;
                 --text-main: #1F2329;
                 --text-sub: #646A73;
                 --border: #DEE0E3;
-            }
-            * { box-sizing: border-box; }
-            body {
+            }}
+            * {{ box-sizing: border-box; }}
+            body {{
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", sans-serif;
                 background-color: var(--bg);
                 color: var(--text-main);
@@ -327,33 +328,115 @@ def index_html():
                 padding: 16px;
                 display: flex;
                 justify-content: center;
-            }
-            .container {
-                max-width: 480px;
+            }}
+            .container {{
+                max-width: 500px;
                 width: 100%;
-            }
-            .brand-header {
+            }}
+            .brand-header {{
                 text-align: center;
                 margin-bottom: 16px;
-            }
-            .brand-title {
+            }}
+            .brand-title {{
                 font-size: 24px;
                 font-weight: 700;
                 color: var(--primary);
                 margin: 0 0 4px 0;
-            }
-            .brand-sub {
+            }}
+            .brand-sub {{
                 font-size: 13px;
                 color: var(--text-sub);
-            }
-            .nav-tabs {
+            }}
+
+            /* 双通道引导区 */
+            .channel-container {{
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+                margin-bottom: 16px;
+            }}
+            .channel-card-feishu {{
+                background: linear-gradient(135deg, #F0F5FF 0%, #E6EFFF 100%);
+                border: 1.5px solid #ADC8FF;
+                border-radius: 14px;
+                padding: 16px;
+                position: relative;
+            }}
+            .channel-badge-top {{
+                display: inline-block;
+                background: var(--feishu-blue);
+                color: #FFF;
+                font-size: 11px;
+                font-weight: 700;
+                padding: 2px 8px;
+                border-radius: 6px;
+                margin-bottom: 8px;
+            }}
+            .channel-header-row {{
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin-bottom: 6px;
+            }}
+            .channel-header-row .icon {{
+                font-size: 24px;
+            }}
+            .channel-header-row .title {{
+                font-size: 16px;
+                font-weight: 700;
+                color: #1D39C4;
+            }}
+            .channel-desc {{
+                font-size: 13px;
+                color: #4B5563;
+                line-height: 1.45;
+                margin-bottom: 12px;
+            }}
+            .feishu-jump-btn {{
+                display: block;
+                text-align: center;
+                background: var(--feishu-blue);
+                color: #FFF;
+                font-size: 14px;
+                font-weight: 600;
+                padding: 11px 16px;
+                border-radius: 10px;
+                text-decoration: none;
+                box-shadow: 0 3px 10px rgba(51, 112, 255, 0.25);
+                transition: opacity 0.2s;
+            }}
+            .feishu-jump-btn:active {{
+                opacity: 0.85;
+            }}
+
+            .channel-divider {{
+                display: flex;
+                align-items: center;
+                text-align: center;
+                color: var(--text-sub);
+                font-size: 12px;
+                margin: 4px 0;
+            }}
+            .channel-divider::before, .channel-divider::after {{
+                content: '';
+                flex: 1;
+                border-bottom: 1px dashed #D0D3D6;
+            }}
+            .channel-divider:not(:empty)::before {{
+                margin-right: .75em;
+            }}
+            .channel-divider:not(:empty)::after {{
+                margin-left: .75em;
+            }}
+
+            .nav-tabs {{
                 display: flex;
                 background: #E5E9ED;
                 border-radius: 10px;
                 padding: 3px;
                 margin-bottom: 16px;
-            }
-            .nav-tab {
+            }}
+            .nav-tab {{
                 flex: 1;
                 text-align: center;
                 padding: 8px;
@@ -363,70 +446,75 @@ def index_html():
                 border-radius: 8px;
                 color: var(--text-sub);
                 transition: all 0.2s;
-            }
-            .nav-tab.active {
+            }}
+            .nav-tab.active {{
                 background: #FFF;
                 color: var(--primary);
                 box-shadow: 0 2px 6px rgba(0,0,0,0.08);
-            }
-            .card {
+            }}
+            .card {{
                 background: var(--card);
                 border-radius: 16px;
-                padding: 22px;
+                padding: 20px;
                 box-shadow: 0 4px 20px rgba(0, 0, 0, 0.05);
                 margin-bottom: 16px;
-            }
-            .form-item {
+            }}
+            .form-item {{
                 margin-bottom: 16px;
-            }
-            .form-label {
+            }}
+            .form-label {{
                 display: block;
                 font-size: 14px;
                 font-weight: 600;
-                margin-bottom: 8px;
-            }
-            input[type="text"] {
+                margin-bottom: 6px;
+            }}
+            .form-tip {{
+                font-size: 12px;
+                color: #8F959E;
+                margin-top: 4px;
+            }}
+            input[type="text"] {{
                 width: 100%;
                 padding: 12px 14px;
                 border: 1.5px solid var(--border);
                 border-radius: 10px;
                 font-size: 15px;
                 outline: none;
-            }
-            input[type="text"]:focus {
+            }}
+            input[type="text"]:focus {{
                 border-color: var(--primary);
-            }
-            .grid-options {
+            }}
+            .grid-options {{
                 display: grid;
                 grid-template-columns: 1fr 1fr;
                 gap: 10px;
-            }
-            .opt-btn {
+            }}
+            .opt-btn {{
                 padding: 12px;
                 border: 1.5px solid var(--border);
                 background: #FFF;
                 border-radius: 10px;
                 text-align: center;
                 cursor: pointer;
-            }
-            .opt-btn .title {
+            }}
+            .opt-btn .title {{
                 font-size: 15px;
                 font-weight: 600;
-            }
-            .opt-btn .sub {
+            }}
+            .opt-btn .sub {{
                 font-size: 12px;
                 color: var(--text-sub);
                 margin-top: 3px;
-            }
-            .opt-btn.active {
+            }}
+            .opt-btn.active {{
                 border-color: var(--primary);
                 background-color: var(--primary-light);
                 color: var(--primary);
-            }
-            .opt-btn.active .sub {
+            }}
+            .opt-btn.active .sub {{
                 color: var(--primary);
-            }
-            .submit-btn {
+            }}
+            .submit-btn {{
                 width: 100%;
                 padding: 14px;
                 background: var(--primary);
@@ -437,61 +525,61 @@ def index_html():
                 font-weight: 600;
                 cursor: pointer;
                 box-shadow: 0 4px 12px rgba(0, 112, 74, 0.25);
-            }
-            .submit-btn:disabled {
+            }}
+            .submit-btn:disabled {{
                 background: #99C7B6;
                 cursor: not-allowed;
                 box-shadow: none;
-            }
-            .status-banner {
+            }}
+            .status-banner {{
                 border-radius: 14px;
                 padding: 16px;
                 margin-top: 16px;
                 text-align: center;
                 display: none;
-            }
-            .status-banner.making {
+            }}
+            .status-banner.making {{
                 background: #EFF6FF;
                 border: 1.5px solid #BFDBFE;
-            }
-            .status-banner.ready {
+            }}
+            .status-banner.ready {{
                 background: #F0FDF4;
                 border: 2px solid #22C55E;
                 animation: pulse 1.8s infinite;
-            }
-            @keyframes pulse {
-                0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4); }
-                70% { box-shadow: 0 0 0 10px rgba(34, 197, 94, 0); }
-                100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
-            }
-            .pickup-badge-title {
+            }}
+            @keyframes pulse {{
+                0% {{ box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4); }}
+                70% {{ box-shadow: 0 0 0 10px rgba(34, 197, 94, 0); }}
+                100% {{ box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }}
+            }}
+            .pickup-badge-title {{
                 font-size: 13px;
                 font-weight: 600;
-            }
-            .pickup-code-lg {
+            }}
+            .pickup-code-lg {{
                 font-size: 42px;
                 font-weight: 800;
                 margin: 6px 0;
                 letter-spacing: 2px;
-            }
-            .stepper {
+            }}
+            .stepper {{
                 display: flex;
                 justify-content: space-between;
                 margin: 16px 0 8px 0;
                 position: relative;
-            }
-            .step-item {
+            }}
+            .step-item {{
                 flex: 1;
                 text-align: center;
                 font-size: 12px;
                 color: #999;
                 font-weight: 500;
-            }
-            .step-item.active {
+            }}
+            .step-item.active {{
                 color: var(--primary);
                 font-weight: 700;
-            }
-            .step-circle {
+            }}
+            .step-circle {{
                 width: 22px;
                 height: 22px;
                 border-radius: 50%;
@@ -502,49 +590,72 @@ def index_html():
                 justify-content: center;
                 margin: 0 auto 4px auto;
                 font-size: 11px;
-            }
-            .step-item.active .step-circle {
+            }}
+            .step-item.active .step-circle {{
                 background: var(--primary);
                 color: #FFF;
-            }
-            .order-item-card {
+            }}
+            .order-item-card {{
                 border: 1px solid var(--border);
                 border-radius: 12px;
                 padding: 14px;
                 margin-bottom: 12px;
                 background: #FFF;
-            }
-            .order-top {
+            }}
+            .order-top {{
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
                 margin-bottom: 6px;
-            }
-            .status-tag {
+            }}
+            .status-tag {{
                 padding: 3px 8px;
                 border-radius: 6px;
                 font-size: 12px;
                 font-weight: 600;
-            }
+            }}
         </style>
     </head>
     <body>
         <div class="container">
             <div class="brand-header">
                 <div class="brand-title">☕ R Café 点单通道</div>
-                <div class="brand-sub">姓名自动上贴 · 实时查询制作进度</div>
+                <div class="brand-sub">欢迎同事点单 · 自动扣额度制作</div>
             </div>
 
+            <!-- 通道一：飞书实名表单推荐卡片 -->
+            <div class="channel-card-feishu">
+                <span class="channel-badge-top">⭐ 推荐 · 飞书私信通知</span>
+                <div class="channel-header-row">
+                    <span class="icon">📱</span>
+                    <span class="title">飞书实名问卷点单</span>
+                </div>
+                <div class="channel-desc">
+                    自动关联飞书账号实名点单，咖啡出餐后<b>直接通过飞书私信推送取餐码</b>，无需反复盯着网页！
+                </div>
+                <a href="{config.FEISHU_FORM_URL}" target="_blank" class="feishu-jump-btn">
+                    打开飞书表单点单 &rarr;
+                </a>
+            </div>
+
+            <div class="channel-divider">或者选择网页点单</div>
+
+            <!-- Tab 切换 -->
             <div class="nav-tabs">
-                <div class="nav-tab active" id="tabOrder" onclick="switchTab('order')">我要点单</div>
+                <div class="nav-tab active" id="tabOrder" onclick="switchTab('order')">网页花名点单</div>
                 <div class="nav-tab" id="tabStatus" onclick="switchTab('status')">点单进度 / 记录</div>
             </div>
 
+            <!-- Tab 1: 网页花名点单面板 -->
             <div id="panelOrder">
                 <div class="card">
+                    <div style="background: #FFFBE6; border: 1px solid #FFE58F; border-radius: 8px; padding: 10px 12px; font-size: 12px; color: #D48806; margin-bottom: 16px;">
+                        💡 <b>提示</b>：网页点单适合使用花名或匿名，<b>不支持飞书私信推送</b>。下单后请留在网页或切换至「点单进度」查看制作状态。
+                    </div>
+
                     <div class="form-item">
-                        <label class="form-label">您的姓名 / 花名 <span style="color:#E5484D">*</span></label>
-                        <input type="text" id="userName" placeholder="姓名将直接打印在杯贴上" required>
+                        <label class="form-label">您的花名 / 昵称 <span style="color:#E5484D">*</span></label>
+                        <input type="text" id="userName" placeholder="将打印在咖啡杯贴备注上" required>
                     </div>
 
                     <div class="form-item">
@@ -584,11 +695,12 @@ def index_html():
                 </div>
             </div>
 
+            <!-- Tab 2: 进度 / 记录面板 -->
             <div id="panelStatus" style="display: none;">
                 <div class="card" style="margin-bottom: 12px; padding: 16px;">
                     <div style="font-size: 14px; font-weight: 600; margin-bottom: 8px;">快速查询我的点单</div>
                     <div style="display: flex; gap: 8px;">
-                        <input type="text" id="queryName" placeholder="输入姓名或取餐码查询" style="flex: 1;">
+                        <input type="text" id="queryName" placeholder="输入姓名、花名或取餐码" style="flex: 1;">
                         <button onclick="queryMyOrders()" style="padding: 0 16px; background: var(--primary); color: #FFF; border: none; border-radius: 8px; font-weight: 600; cursor: pointer;">查询</button>
                     </div>
                 </div>
@@ -598,6 +710,7 @@ def index_html():
                 </div>
             </div>
 
+            <!-- 动态弹出的即时状态卡片 -->
             <div class="status-banner" id="liveStatusCard">
                 <div class="pickup-badge-title" id="bannerTitle">订单提交中...</div>
                 <div class="pickup-code-lg" id="bannerPickupNo">----</div>
@@ -622,68 +735,68 @@ def index_html():
             let pollingTimer = null;
 
             const savedName = localStorage.getItem('coffee_user_name');
-            if (savedName) {
+            if (savedName) {{
                 document.getElementById('userName').value = savedName;
                 document.getElementById('queryName').value = savedName;
-            }
+            }}
 
-            if (activeOrderNo) {
+            if (activeOrderNo) {{
                 startPollingStatus(activeOrderNo, activePickupNo);
-            }
+            }}
 
-            function switchTab(tab) {
-                if (tab === 'order') {
+            function switchTab(tab) {{
+                if (tab === 'order') {{
                     document.getElementById('tabOrder').classList.add('active');
                     document.getElementById('tabStatus').classList.remove('active');
                     document.getElementById('panelOrder').style.display = 'block';
                     document.getElementById('panelStatus').style.display = 'none';
-                } else {
+                }} else {{
                     document.getElementById('tabStatus').classList.add('active');
                     document.getElementById('tabOrder').classList.remove('active');
                     document.getElementById('panelOrder').style.display = 'none';
                     document.getElementById('panelStatus').style.display = 'block';
                     queryMyOrders();
-                }
-            }
+                }}
+            }}
 
-            function setProduct(p, el) {
+            function setProduct(p, el) {{
                 selectedProduct = p;
                 el.parentElement.querySelectorAll('.opt-btn').forEach(btn => btn.classList.remove('active'));
                 el.classList.add('active');
-            }
+            }}
 
-            function setTemp(t, el) {
+            function setTemp(t, el) {{
                 selectedTemp = t;
                 el.parentElement.querySelectorAll('.opt-btn').forEach(btn => btn.classList.remove('active'));
                 el.classList.add('active');
-            }
+            }}
 
-            async function doSubmit() {
+            async function doSubmit() {{
                 const name = document.getElementById('userName').value.trim();
                 const remark = document.getElementById('remark').value.trim();
                 const btn = document.getElementById('submitBtn');
 
-                if (!name) {
-                    alert('请输入您的姓名或花名！');
+                if (!name) {{
+                    alert('请输入您的花名或昵称！');
                     document.getElementById('userName').focus();
                     return;
-                }
+                }}
 
                 localStorage.setItem('coffee_user_name', name);
                 btn.disabled = true;
                 btn.innerText = '正在提交订单...';
 
-                try {
-                    const res = await fetch('/api/order', {
+                try {{
+                    const res = await fetch('/api/order', {{
                         method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({
+                        headers: {{'Content-Type': 'application/json'}},
+                        body: JSON.stringify({{
                             user_name: name,
                             product: selectedProduct,
                             temp: selectedTemp,
                             remark: remark
-                        })
-                    });
+                        }})
+                    }});
                     const data = await res.json();
                     if (!res.ok) throw new Error(data.detail || data.error || '下单失败');
 
@@ -693,15 +806,15 @@ def index_html():
                     localStorage.setItem('last_pickup_no', activePickupNo);
 
                     startPollingStatus(activeOrderNo, activePickupNo);
-                } catch (e) {
+                }} catch (e) {{
                     alert('下单失败: ' + e.message);
-                } finally {
+                }} finally {{
                     btn.disabled = false;
                     btn.innerText = '立即下单';
-                }
-            }
+                }}
+            }}
 
-            function startPollingStatus(orderNo, pickupNo) {
+            function startPollingStatus(orderNo, pickupNo) {{
                 const banner = document.getElementById('liveStatusCard');
                 banner.style.display = 'block';
                 document.getElementById('bannerPickupNo').innerText = pickupNo || '----';
@@ -709,11 +822,11 @@ def index_html():
                 if (pollingTimer) clearInterval(pollingTimer);
                 checkStatus(orderNo, pickupNo);
                 pollingTimer = setInterval(() => checkStatus(orderNo, pickupNo), 8000);
-            }
+            }}
 
-            async function checkStatus(orderNo, pickupNo) {
-                try {
-                    const res = await fetch(`/api/order/status?order_no=${encodeURIComponent(orderNo)}&pickup_no=${encodeURIComponent(pickupNo)}`);
+            async function checkStatus(orderNo, pickupNo) {{
+                try {{
+                    const res = await fetch(`/api/order/status?order_no=${{encodeURIComponent(orderNo)}}&pickup_no=${{encodeURIComponent(pickupNo)}}`);
                     const data = await res.json();
                     if (!data.found) return;
 
@@ -728,22 +841,22 @@ def index_html():
 
                     ['step1', 'step2', 'step3', 'step4'].forEach(id => document.getElementById(id).classList.remove('active'));
 
-                    if (data.status === 'pending') {
+                    if (data.status === 'pending') {{
                         banner.className = 'status-banner making';
                         titleEl.innerText = '⏳ 订单已提交，排队中...';
                         document.getElementById('step1').classList.add('active');
-                    } else if (data.status === 'making') {
+                    }} else if (data.status === 'making') {{
                         banner.className = 'status-banner making';
                         titleEl.innerText = '👨‍🍳 咖啡师正在制作中...';
                         document.getElementById('step1').classList.add('active');
                         document.getElementById('step2').classList.add('active');
-                    } else if (data.status === 'ready') {
+                    }} else if (data.status === 'ready') {{
                         banner.className = 'status-banner ready';
                         titleEl.innerText = '🔔 咖啡做好了！请前往吧台领取';
                         document.getElementById('step1').classList.add('active');
                         document.getElementById('step2').classList.add('active');
                         document.getElementById('step3').classList.add('active');
-                    } else if (data.status === 'completed') {
+                    }} else if (data.status === 'completed') {{
                         banner.className = 'status-banner';
                         titleEl.innerText = '✅ 订单已完成取餐';
                         document.getElementById('step1').classList.add('active');
@@ -751,56 +864,56 @@ def index_html():
                         document.getElementById('step3').classList.add('active');
                         document.getElementById('step4').classList.add('active');
                         clearInterval(pollingTimer);
-                    }
-                } catch(e) {
+                    }}
+                }} catch(e) {{
                     console.log('轮询状态异常', e);
-                }
-            }
+                }}
+            }}
 
-            async function queryMyOrders() {
+            async function queryMyOrders() {{
                 const keyword = document.getElementById('queryName').value.trim();
                 const listEl = document.getElementById('ordersList');
                 listEl.innerHTML = '<div style="text-align:center; color:#888; padding:20px;">正在获取订单列表...</div>';
 
-                try {
+                try {{
                     const res = await fetch('/api/orders/my');
                     const data = await res.json();
                     const items = data.items || [];
 
                     let filtered = items;
-                    if (keyword) {
+                    if (keyword) {{
                         filtered = items.filter(it => 
                             (it.remark && it.remark.includes(keyword)) ||
                             it.pickupNo === keyword ||
                             it.orderNo === keyword
                         );
-                    }
+                    }}
 
-                    if (filtered.length === 0) {
-                        listEl.innerHTML = `<div style="text-align:center; color:#888; padding:30px;">未找到与 "${keyword}" 相关的订单</div>`;
+                    if (filtered.length === 0) {{
+                        listEl.innerHTML = `<div style="text-align:center; color:#888; padding:30px;">未找到与 "${{keyword}}" 相关的订单</div>`;
                         return;
-                    }
+                    }}
 
                     let html = '';
-                    filtered.slice(0, 15).forEach(it => {
-                        const productInfo = it.items && it.items[0] ? `${it.items[0].productName} (${it.items[0].specInfo || ''})` : '咖啡';
+                    filtered.slice(0, 15).forEach(it => {{
+                        const productInfo = it.items && it.items[0] ? `${{it.items[0].productName}} (${{it.items[0].specInfo || ''}})` : '咖啡';
                         html += `
                         <div class="order-item-card">
                             <div class="order-top">
-                                <span style="font-size: 20px; font-weight: 800; color: var(--primary);">取餐号: ${it.pickupNo}</span>
-                                <span class="status-tag" style="background: ${it.statusColor}20; color: ${it.statusColor};">${it.statusText}</span>
+                                <span style="font-size: 20px; font-weight: 800; color: var(--primary);">取餐号: ${{it.pickupNo}}</span>
+                                <span class="status-tag" style="background: ${{it.statusColor}}20; color: ${{it.statusColor}};">${{it.statusText}}</span>
                             </div>
-                            <div style="font-size: 14px; font-weight: 600; margin-bottom: 4px;">${productInfo}</div>
-                            <div style="font-size: 12px; color: #555;">${it.remark || '无备注'}</div>
-                            <div style="font-size: 11px; color: #999; margin-top: 6px;">下单时间: ${new Date(it.createdAt).toLocaleTimeString()} · 状态: ${it.statusDesc}</div>
+                            <div style="font-size: 14px; font-weight: 600; margin-bottom: 4px;">${{productInfo}}</div>
+                            <div style="font-size: 12px; color: #555;">${{it.remark || '无备注'}}</div>
+                            <div style="font-size: 11px; color: #999; margin-top: 6px;">下单时间: ${{new Date(it.createdAt).toLocaleTimeString()}} · 状态: ${{it.statusDesc}}</div>
                         </div>
                         `;
-                    });
+                    }});
                     listEl.innerHTML = html;
-                } catch (e) {
-                    listEl.innerHTML = `<div style="color:red; text-align:center; padding:20px;">加载失败: ${e.message}</div>`;
-                }
-            }
+                }} catch (e) {{
+                    listEl.innerHTML = `<div style="color:red; text-align:center; padding:20px;">加载失败: ${{e.message}}</div>`;
+                }}
+            }}
         </script>
     </body>
     </html>
