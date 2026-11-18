@@ -1,0 +1,15 @@
+[Unit]
+Description=R Cafe Ordering Service for Feishu
+After=network.target
+
+[Service]
+Type=simple
+User=duyingfang
+WorkingDirectory=/home/duyingfang/cafe-service
+ExecStart=/home/duyingfang/cafe-service/venv/bin/python app.py
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/duyingfang/cafe-service/.env
+
+[Install]
+WantedBy=multi-user.target
