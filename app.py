@@ -927,11 +927,17 @@ def index_html():
             let pollingTimer = null;
             let allOrdersCache = [];
 
-            const savedName = localStorage.getItem('coffee_user_name');
+            let savedName = localStorage.getItem('coffee_user_name') || '';
+            // 若缓存包含测试关键词，立即抹除，避免每次打开误入测试分支
+            if (/测试|test|mock/i.test(savedName)) {{
+                localStorage.removeItem('coffee_user_name');
+                savedName = '';
+            }}
             if (savedName) {{
                 document.getElementById('userName').value = savedName;
-                document.getElementById('queryName').value = savedName;
             }}
+            // 筛选框默认保持为空，进入点单记录时展示完整出单队列
+            document.getElementById('queryName').value = '';
 
             if (activeOrderNo) {{
                 startPollingStatus(activeOrderNo, activePickupNo);
@@ -978,8 +984,11 @@ def index_html():
                     return;
                 }}
 
-                localStorage.setItem('coffee_user_name', name);
-                document.getElementById('queryName').value = name;
+                if (!/测试|test|mock/i.test(name)) {{
+                    localStorage.setItem('coffee_user_name', name);
+                }} else {{
+                    localStorage.removeItem('coffee_user_name');
+                }}
 
                 btn.disabled = true;
                 btnSpinner.style.display = 'block';
