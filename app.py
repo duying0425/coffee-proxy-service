@@ -1,12 +1,13 @@
 """
 R Cafe 开放点单服务主程序 (FastAPI)
 包含：
-1. 测试/演练模式 (DRY_RUN)：不向真实系统扣豆下单，10秒后自动触发完成通知，全链路测试多维表格与网页点单
-2. 紧凑型双通道引导（精简顶部通知条，释放首屏空间）
-3. 0ms 即时触觉反馈 + 按钮加载动效 + 实时出单骨架卡片
-4. 制作进度 / 记录页面：输入花名/取餐码实时即时筛选（无需手动点查询）
-5. 飞书多维表格 / 自定义 Webhook 自动化点单
-6. 后台自动巡检与飞书取餐就绪 Webhook 推送
+1. 正常营业模式 (DRY_RUN=false)：真实咖啡接口下单
+2. 出餐通知精准推送：仅在【待取餐（ready）】时推送1次，【取餐完成（completed）】绝对不二次打扰
+3. 紧凑型双通道引导（精简顶部通知条，释放首屏空间）
+4. 0ms 即时触觉反馈 + 按钮加载动效 + 实时出单骨架卡片
+5. 制作进度 / 记录页面：输入花名/取餐码实时即时筛选（无需手动点查询）
+6. 飞书多维表格 / 自定义 Webhook 自动化点单
+7. 后台自动巡检与飞书取餐就绪 Webhook 推送
 """
 import os
 import json
@@ -14,7 +15,7 @@ import random
 import asyncio
 from datetime import datetime
 from typing import Optional, Any, Dict, List
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
@@ -52,7 +53,7 @@ async def startup_event():
 
 
 async def order_status_monitor_loop():
-    """后台任务：每 15 秒轮询一次，发现订单餐好自动推送飞书 Webhook"""
+    """后台任务：每 15 秒轮询一次，仅在订单餐好时推送1次飞书 Webhook（取餐完成不二次提醒）"""
     print(f"[Monitor] 启动后台订单状态监听巡检 (当前测试模式: {config.DRY_RUN})...")
     try:
         init_data = client.get_my_orders()
@@ -74,7 +75,8 @@ async def order_status_monitor_loop():
                 order_no = item.get("orderNo")
                 status = item.get("status")
                 
-                if status in ("ready", "completed") and order_no not in notified_ready_orders:
+                # 仅在待取餐（ready）时发送提醒，避免在取餐完成（completed）时二次打扰
+                if status == "ready" and order_no not in notified_ready_orders:
                     remark = item.get("remark") or ""
                     colleague = "同事"
                     if "点单人:" in remark:
@@ -102,16 +104,19 @@ async def order_status_monitor_loop():
                     }
                     try:
                         resp = requests.post(config.FEISHU_NOTIFY_WEBHOOK, json=payload, timeout=8)
-                        print(f"[Monitor] 触发飞书通知: {order_no} ({pickup_no}), 响应: {resp.text}")
+                        print(f"[Monitor] 触发出餐提醒: {order_no} ({pickup_no}), 响应: {resp.text}")
                         notified_ready_orders.add(order_no)
                     except Exception as post_err:
-                        print(f"[Monitor] 推送飞书通知失败: {post_err}")
+                        print(f"[Monitor] 推送飞书出餐提醒失败: {post_err}")
+                elif status == "completed":
+                    # 取餐完成（completed），直接记录为已通知，绝不发送二次打扰通知
+                    notified_ready_orders.add(order_no)
         except Exception as poll_err:
             print(f"[Monitor] 轮询订单异常: {poll_err}")
 
 
 async def simulate_mock_order_ready(order_no: str, pickup_no: str, colleague: str, product_name: str, temp: str):
-    """测试模式专享：10秒后自动触发完成通知，全链路模拟出餐流程"""
+    """测试模式专享：10秒后自动触发完成通知"""
     await asyncio.sleep(10)
     print(f"[Mock] 测试订单 {order_no} 模拟制作完成，准备触发飞书通知...")
     
@@ -292,7 +297,7 @@ def get_order_status(order_no: Optional[str] = None, pickup_no: Optional[str] = 
 
 @app.post("/api/order")
 async def submit_order_web(order: OrderSubmitReq):
-    """Web 界面下单接口（转为 async def 避免线程池无 event_loop 报错）"""
+    """Web 界面下单接口"""
     if not config.ALLOW_ORDERING:
         raise HTTPException(status_code=400, detail="服务当前已暂停接单")
 
@@ -300,6 +305,7 @@ async def submit_order_web(order: OrderSubmitReq):
     if not user_name:
         raise HTTPException(status_code=400, detail="请输入您的姓名或花名")
 
+    # 显式测试前缀才走 mock，正常用户走真实下单
     is_mock = config.DRY_RUN or any(x in user_name for x in ["测试", "test", "Test"])
     if is_mock:
         res = handle_dry_run_order(
@@ -308,7 +314,6 @@ async def submit_order_web(order: OrderSubmitReq):
             temp_str=order.temp,
             remark_str=order.remark
         )
-        # 10秒后自动触发完成通知
         asyncio.create_task(simulate_mock_order_ready(res["orderNo"], res["pickupNo"], user_name, res["productName"], res["temp"]))
         return {
             "status": "success",
@@ -342,7 +347,7 @@ async def submit_order_web(order: OrderSubmitReq):
 @app.post("/api/feishu/webhook")
 @app.post("/webhook")
 async def handle_feishu_webhook(request: Request):
-    """飞书多维表格表单 / 自动化 Webhook 专用接口（支持演练模式）"""
+    """飞书多维表格表单 / 自动化 Webhook 专用接口"""
     if not config.ALLOW_ORDERING:
         return JSONResponse(status_code=400, content={"error": "服务当前已暂停接单"})
 
