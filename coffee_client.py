@@ -5,7 +5,6 @@ import requests
 import json
 from typing import Dict, List, Optional, Tuple
 
-# 预置商品与规格字典
 PRESET_PRODUCTS = {
     "americano": {
         "id": "d207db00-c102-40e4-a82e-62c062d908ed",
@@ -43,6 +42,7 @@ class RCafeClient:
         self.csrf_token = csrf_token
         self.session_token = session_token
         self.web_did = web_did
+        self._session = requests.Session()
 
     @property
     def headers(self) -> Dict[str, str]:
@@ -57,30 +57,24 @@ class RCafeClient:
         }
 
     def get_menu(self) -> dict:
-        """获取咖啡菜单及规格"""
         url = f"{self.base_url}/api/coffee/menu?type=coffee"
-        resp = requests.get(url, headers=self.headers, timeout=10)
+        resp = self._session.get(url, headers=self.headers, timeout=8)
         resp.raise_for_status()
         return resp.json()
 
     def get_balance(self) -> dict:
-        """获取个人当前余额/R豆"""
         url = f"{self.base_url}/api/coffee/points/summary"
-        resp = requests.get(url, headers=self.headers, timeout=10)
+        resp = self._session.get(url, headers=self.headers, timeout=8)
         resp.raise_for_status()
         return resp.json()
 
     def get_my_orders(self) -> dict:
-        """获取我的历史/最新订单列表（包含取餐码）"""
         url = f"{self.base_url}/api/coffee/orders/my"
-        resp = requests.get(url, headers=self.headers, timeout=10)
+        resp = self._session.get(url, headers=self.headers, timeout=8)
         resp.raise_for_status()
         return resp.json()
 
     def create_order(self, product_id: str, spec_ids: List[str], remark: Optional[str] = None, quantity: int = 1) -> dict:
-        """
-        底层下单接口
-        """
         url = f"{self.base_url}/api/coffee/orders"
         payload = {
             "items": [
@@ -95,7 +89,7 @@ class RCafeClient:
             "pointsBeanType": "r",
             "couponInstanceId": None
         }
-        resp = requests.post(url, headers=self.headers, json=payload, timeout=10)
+        resp = self._session.post(url, headers=self.headers, json=payload, timeout=8)
         resp.raise_for_status()
         return resp.json()
 
@@ -106,10 +100,6 @@ class RCafeClient:
         temp_str: str,
         extra_remark: Optional[str] = None
     ) -> dict:
-        """
-        高阶下单函数：自动识别商品、规格，并将同事姓名规范写入备注
-        """
-        # 1. 匹配商品
         matched_product = None
         p_clean = product_str.strip().lower()
         for key, p_data in PRESET_PRODUCTS.items():
@@ -120,7 +110,6 @@ class RCafeClient:
         if not matched_product:
             raise ValueError(f"未找到对应饮品: '{product_str}'，当前支持：美式、拿铁")
 
-        # 2. 匹配温度
         t_clean = temp_str.strip().lower()
         if any(w in t_clean for w in ["冰", "冷", "ice", "cold"]):
             temp_key = "冰饮"
@@ -134,29 +123,33 @@ class RCafeClient:
         sugar_id = list(matched_product["specs"]["sugar"].values())[0]
         spec_ids = [cup_id, temp_id, sugar_id]
 
-        # 3. 构造备注（核心：同事姓名明确写入备注）
         user_name = user_name.strip()
         if extra_remark and extra_remark.strip():
             final_remark = f"点单人: {user_name} ({extra_remark.strip()})"
         else:
             final_remark = f"点单人: {user_name}"
 
-        # 4. 执行下单
-        self.create_order(
+        # 核心性能优化：直接使用 create_order 返回的 order 实体，避免二次网络请求
+        order_res = self.create_order(
             product_id=matched_product["id"],
             spec_ids=spec_ids,
             remark=final_remark,
             quantity=1
         )
 
-        # 5. 立即查询最新订单获取取餐号
-        orders_info = self.get_my_orders()
-        items = orders_info.get("items", [])
-        latest_order = items[0] if items else {}
+        created_order = order_res.get("order")
+        if not created_order:
+            # 兼容极端情况
+            orders_info = self.get_my_orders()
+            items = orders_info.get("items", [])
+            created_order = items[0] if items else {}
+
+        pickup_no = created_order.get("pickupNo", "已生成")
+        order_no = created_order.get("orderNo", "")
 
         return {
-            "pickupNo": latest_order.get("pickupNo", "已生成"),
-            "orderNo": latest_order.get("orderNo", ""),
+            "pickupNo": pickup_no,
+            "orderNo": order_no,
             "productName": matched_product["name"],
             "temp": temp_key,
             "cost": matched_product["price"],
