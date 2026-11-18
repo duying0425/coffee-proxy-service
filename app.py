@@ -1,15 +1,18 @@
 """
 R Cafe 开放点单服务主程序 (FastAPI)
 包含：
-1. 紧凑型双通道引导（精简顶部通知条，释放首屏空间）
-2. 0ms 即时触觉反馈 + 按钮加载动效 + 实时出单骨架卡片
-3. 制作进度 / 记录页面：输入花名/取餐码实时即时筛选（无需手动点查询）
-4. 飞书多维表格 / 自定义 Webhook 自动化点单
-5. 后台自动巡检与飞书取餐就绪 Webhook 推送
+1. 测试/演练模式 (DRY_RUN)：不向真实系统扣豆下单，10秒后自动触发完成通知，全链路测试多维表格
+2. 紧凑型双通道引导（精简顶部通知条，释放首屏空间）
+3. 0ms 即时触觉反馈 + 按钮加载动效 + 实时出单骨架卡片
+4. 制作进度 / 记录页面：输入花名/取餐码实时即时筛选（无需手动点查询）
+5. 飞书多维表格 / 自定义 Webhook 自动化点单
+6. 后台自动巡检与飞书取餐就绪 Webhook 推送
 """
 import os
 import json
+import random
 import asyncio
+from datetime import datetime
 from typing import Optional, Any, Dict, List
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -30,6 +33,9 @@ client = RCafeClient(
 )
 
 daily_orders_cache: Dict[str, int] = {}
+mock_orders_cache: Dict[str, dict] = {}
+notified_ready_orders = set()
+
 STATUS_MAP = {
     "pending": {"text": "待制作", "color": "#E67E22", "desc": "订单已提交，吧台排队中..."},
     "making": {"text": "制作中", "color": "#2F6FED", "desc": "咖啡师正在制作您的饮品..."},
@@ -37,8 +43,6 @@ STATUS_MAP = {
     "completed": {"text": "已完成", "color": "#646A73", "desc": "已核销取餐"},
     "cancelled": {"text": "已取消", "color": "#E5484D", "desc": "订单已取消，R豆已原路退回"}
 }
-
-notified_ready_orders = set()
 
 
 @app.on_event("startup")
@@ -49,13 +53,13 @@ async def startup_event():
 
 async def order_status_monitor_loop():
     """后台任务：每 15 秒轮询一次，发现订单餐好自动推送飞书 Webhook"""
-    print("[Monitor] 启动后台订单状态监听巡检...")
+    print(f"[Monitor] 启动后台订单状态监听巡检 (当前测试模式: {config.DRY_RUN})...")
     try:
         init_data = client.get_my_orders()
         for item in init_data.get("items", []):
             if item.get("status") in ("ready", "completed"):
                 notified_ready_orders.add(item.get("orderNo"))
-        print(f"[Monitor] 已初始化历史订单缓存: {len(notified_ready_orders)} 笔")
+        print(f"[Monitor] 已初始化真实历史订单缓存: {len(notified_ready_orders)} 笔")
     except Exception as e:
         print(f"[Monitor] 初始化订单缓存异常: {e}")
 
@@ -106,6 +110,70 @@ async def order_status_monitor_loop():
             print(f"[Monitor] 轮询订单异常: {poll_err}")
 
 
+async def simulate_mock_order_ready(order_no: str, pickup_no: str, colleague: str, product_name: str, temp: str):
+    """测试模式专享：10秒后自动触发完成通知，全链路模拟出餐流程"""
+    await asyncio.sleep(10)
+    print(f"[Mock] 测试订单 {order_no} 模拟制作完成，准备触发飞书通知...")
+    
+    if order_no in mock_orders_cache:
+        mock_orders_cache[order_no]["status"] = "ready"
+        mock_orders_cache[order_no]["statusText"] = "待取餐（餐好）"
+        mock_orders_cache[order_no]["statusColor"] = "#27AE60"
+        mock_orders_cache[order_no]["statusDesc"] = "🎉【测试演练】咖啡已做好，请前往吧台领取！"
+        mock_orders_cache[order_no]["isReady"] = True
+
+    if config.FEISHU_NOTIFY_WEBHOOK:
+        payload = {
+            "pickup_no": pickup_no,
+            "order_no": order_no,
+            "colleague": colleague,
+            "product": product_name,
+            "spec": f"中杯 / {temp} / 无糖",
+            "status": "待取餐",
+            "message": f"☕【测试演练通知】您的 {product_name} 已做好！取餐码为 {pickup_no}，请尽快前往吧台领取！"
+        }
+        try:
+            resp = requests.post(config.FEISHU_NOTIFY_WEBHOOK, json=payload, timeout=8)
+            print(f"[Mock] 测试订单飞书通知已发送: {order_no}, 飞书响应: {resp.text}")
+        except Exception as e:
+            print(f"[Mock] 发送测试通知异常: {e}")
+
+
+def handle_dry_run_order(user_name: str, product_str: str, temp_str: str, remark_str: Optional[str] = None) -> dict:
+    """生成测试模拟订单"""
+    pickup_no = f"T{random.randint(101, 899)}"
+    order_no = f"TEST{datetime.now().strftime('%m%d%H%M%S')}"
+    
+    # 规整商品名
+    p_name = "拿铁" if "拿铁" in product_str or "latte" in product_str.lower() else "美式咖啡"
+    t_name = "冰饮" if any(x in temp_str for x in ["冰", "冷", "ice", "cold"]) else "热饮"
+
+    full_remark = f"点单人: {user_name} (测试演练)"
+    if remark_str and remark_str.strip():
+        full_remark += f" | {remark_str.strip()}"
+
+    res_data = {
+        "pickupNo": pickup_no,
+        "orderNo": order_no,
+        "productName": p_name,
+        "temp": t_name,
+        "cost": 0.0,
+        "colleague": user_name,
+        "remark": full_remark,
+        "status": "making",
+        "statusText": "制作中 (测试模拟)",
+        "statusColor": "#2F6FED",
+        "statusDesc": "【测试模式】系统正在模拟制作，10秒后自动触发完成通知...",
+        "isReady": False,
+        "createdAt": datetime.now().isoformat()
+    }
+
+    mock_orders_cache[order_no] = res_data
+    # 启动 10 秒后模拟出餐并向飞书推送
+    asyncio.create_task(simulate_mock_order_ready(order_no, pickup_no, user_name, p_name, t_name))
+    return res_data
+
+
 class OrderSubmitReq(BaseModel):
     user_name: str
     product: str
@@ -122,6 +190,7 @@ def get_service_info():
             "status": "online",
             "owner": balance.get("userName"),
             "rBalance": balance.get("rBalance"),
+            "dryRun": config.DRY_RUN,
             "allowOrdering": config.ALLOW_ORDERING,
             "maxDailyPerUser": config.MAX_ORDERS_PER_PERSON_DAILY,
             "feishuFormUrl": config.FEISHU_FORM_URL,
@@ -136,23 +205,58 @@ def get_service_info():
 
 @app.get("/api/orders/my")
 def get_my_orders():
-    """获取最新点单列表与取餐状态"""
+    """获取最新点单列表与取餐状态（整合测试模拟单）"""
     try:
         data = client.get_my_orders()
-        for item in data.get("items", []):
+        items = data.get("items", [])
+        
+        # 将正在进行的测试单合并在最前列
+        for mock_item in list(mock_orders_cache.values())[::-1]:
+            items.insert(0, {
+                "orderNo": mock_item["orderNo"],
+                "pickupNo": mock_item["pickupNo"],
+                "status": mock_item["status"],
+                "statusText": mock_item["statusText"],
+                "statusColor": mock_item["statusColor"],
+                "statusDesc": mock_item["statusDesc"],
+                "remark": mock_item["remark"],
+                "createdAt": mock_item["createdAt"],
+                "items": [{
+                    "productName": mock_item["productName"],
+                    "specInfo": f"中杯 / {mock_item['temp']} / 无糖"
+                }]
+            })
+
+        for item in items:
             st = item.get("status", "unknown")
-            info = STATUS_MAP.get(st, {"text": st, "color": "#888", "desc": ""})
-            item["statusText"] = info["text"]
-            item["statusColor"] = info["color"]
-            item["statusDesc"] = info["desc"]
-        return data
+            if "statusText" not in item:
+                info = STATUS_MAP.get(st, {"text": st, "color": "#888", "desc": ""})
+                item["statusText"] = info["text"]
+                item["statusColor"] = info["color"]
+                item["statusDesc"] = info["desc"]
+        return {"items": items}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/order/status")
 def get_order_status(order_no: Optional[str] = None, pickup_no: Optional[str] = None, user_name: Optional[str] = None):
-    """单单查询或按姓名查询最新订单进度"""
+    """单单查询或按姓名查询最新订单进度（支持模拟测试单）"""
+    if order_no and order_no in mock_orders_cache:
+        m = mock_orders_cache[order_no]
+        return {
+            "found": True,
+            "orderNo": m["orderNo"],
+            "pickupNo": m["pickupNo"],
+            "status": m["status"],
+            "statusText": m["statusText"],
+            "statusColor": m["statusColor"],
+            "statusDesc": m["statusDesc"],
+            "isReady": m.get("isReady", False),
+            "remark": m["remark"],
+            "items": [{"productName": m["productName"]}]
+        }
+
     try:
         data = client.get_my_orders()
         items = data.get("items", [])
@@ -200,6 +304,21 @@ def submit_order_web(order: OrderSubmitReq):
     if not user_name:
         raise HTTPException(status_code=400, detail="请输入您的姓名或花名")
 
+    # 判断是否为测试模式
+    is_mock = config.DRY_RUN or any(x in user_name for x in ["测试", "test", "Test"])
+    if is_mock:
+        res = handle_dry_run_order(
+            user_name=user_name,
+            product_str=order.product,
+            temp_str=order.temp,
+            remark_str=order.remark
+        )
+        return {
+            "status": "success",
+            "message": "【测试演练成功】已生成模拟取餐号，10秒后将自动模拟出餐通知",
+            **res
+        }
+
     user_count = daily_orders_cache.get(user_name, 0)
     if user_count >= config.MAX_ORDERS_PER_PERSON_DAILY:
         raise HTTPException(status_code=400, detail=f"您今日点单已达上限（{config.MAX_ORDERS_PER_PERSON_DAILY}杯）")
@@ -226,7 +345,7 @@ def submit_order_web(order: OrderSubmitReq):
 @app.post("/api/feishu/webhook")
 @app.post("/webhook")
 async def handle_feishu_webhook(request: Request):
-    """飞书多维表格表单 / 自动化 Webhook 专用接口"""
+    """飞书多维表格表单 / 自动化 Webhook 专用接口（支持演练模式）"""
     if not config.ALLOW_ORDERING:
         return JSONResponse(status_code=400, content={"error": "服务当前已暂停接单"})
 
@@ -268,6 +387,23 @@ async def handle_feishu_webhook(request: Request):
     if remark:
         remark = str(remark).strip()
 
+    # 判断是否为测试/演练模式
+    is_mock = config.DRY_RUN or data.get("dry_run") is True or any(x in user_name for x in ["测试", "test", "Test"])
+    if is_mock:
+        print(f"[Webhook] 收到飞书测试演练点单: {user_name} - {product} ({temp})")
+        res = handle_dry_run_order(
+            user_name=user_name,
+            product_str=product,
+            temp_str=temp,
+            remark_str=remark
+        )
+        return {
+            "status": "success",
+            "code": 0,
+            "message": "【演练模式】测试下单成功（未真实扣豆），10秒后将触发完成通知",
+            "data": res
+        }
+
     user_count = daily_orders_cache.get(user_name, 0)
     if user_count >= config.MAX_ORDERS_PER_PERSON_DAILY:
         return JSONResponse(
@@ -298,7 +434,9 @@ async def handle_feishu_webhook(request: Request):
 
 @app.get("/", response_class=HTMLResponse)
 def index_html():
-    """紧凑现代化响应式前台（实时即时筛选 + 0ms 触控即时反馈 + 实时出餐动效）"""
+    """紧凑现代化响应式前台"""
+    status_tag_html = '<div class="status-pill" style="color:#D97706; background:#FEF3C7;">● 测试演练模式 (不扣豆)</div>' if config.DRY_RUN else '<div class="status-pill">● 营业中</div>'
+
     return f"""
     <!DOCTYPE html>
     <html lang="zh-CN">
@@ -334,7 +472,6 @@ def index_html():
                 width: 100%;
             }}
 
-            /* 1. 紧凑型顶部飞书胶囊条 */
             .compact-feishu-bar {{
                 display: flex;
                 align-items: center;
@@ -365,7 +502,6 @@ def index_html():
                 white-space: nowrap;
             }}
 
-            /* 2. 精简头部 */
             .brand-header {{
                 display: flex;
                 justify-content: space-between;
@@ -387,10 +523,9 @@ def index_html():
                 background: var(--primary-light);
                 padding: 3px 8px;
                 border-radius: 12px;
-                font-weight: 500;
+                font-weight: 600;
             }}
 
-            /* 3. Tab 切换 */
             .nav-tabs {{
                 display: flex;
                 background: #E8ECEF;
@@ -415,7 +550,6 @@ def index_html():
                 box-shadow: 0 1px 4px rgba(0,0,0,0.06);
             }}
 
-            /* 4. 卡片区域 */
             .card {{
                 background: var(--card);
                 border-radius: 14px;
@@ -485,7 +619,6 @@ def index_html():
                 color: var(--primary);
             }}
 
-            /* 5. 立即下单按钮与 0ms 触控响应 */
             .submit-btn {{
                 width: 100%;
                 padding: 13px;
@@ -527,7 +660,6 @@ def index_html():
                 to {{ transform: rotate(360deg); }}
             }}
 
-            /* 6. 即时订单状态卡片 */
             .status-banner {{
                 border-radius: 12px;
                 padding: 16px;
@@ -618,7 +750,6 @@ def index_html():
                 font-weight: 600;
             }}
 
-            /* 实时搜索框与操作区 */
             .search-box-wrapper {{
                 display: flex;
                 gap: 8px;
@@ -666,7 +797,6 @@ def index_html():
     </head>
     <body>
         <div class="container">
-            <!-- 1. 紧凑型飞书通道胶囊条 -->
             <div class="compact-feishu-bar">
                 <div>
                     <span class="pill-tag">飞书实名</span>
@@ -677,19 +807,16 @@ def index_html():
                 </a>
             </div>
 
-            <!-- 2. 精简头部 -->
             <div class="brand-header">
                 <div class="brand-title">☕ R Café 咖啡点单</div>
-                <div class="status-pill">● 营业中</div>
+                {status_tag_html}
             </div>
 
-            <!-- 3. Tab 切换 -->
             <div class="nav-tabs">
                 <div class="nav-tab active" id="tabOrder" onclick="switchTab('order')">网页花名点单</div>
                 <div class="nav-tab" id="tabStatus" onclick="switchTab('status')">制作进度 / 记录</div>
             </div>
 
-            <!-- 4. 点单面板 -->
             <div id="panelOrder">
                 <div class="card">
                     <div class="form-item">
@@ -731,7 +858,6 @@ def index_html():
                         <input type="text" id="remark" placeholder="如：少冰、稍后做等">
                     </div>
 
-                    <!-- 立即响应下单按钮 -->
                     <button class="submit-btn" id="submitBtn" onclick="doSubmit()">
                         <div class="spinner" id="btnSpinner"></div>
                         <span id="btnText">立即下单</span>
@@ -739,7 +865,6 @@ def index_html():
                 </div>
             </div>
 
-            <!-- 5. 进度 / 记录面板（带实时即时输入筛选） -->
             <div id="panelStatus" style="display: none;">
                 <div class="card" style="margin-bottom: 10px; padding: 12px 14px;">
                     <div class="search-box-wrapper">
@@ -758,7 +883,6 @@ def index_html():
                 </div>
             </div>
 
-            <!-- 6. 实时动态出单进度卡片 -->
             <div class="status-banner" id="liveStatusCard">
                 <div class="pickup-badge-title" id="bannerTitle">订单提交中...</div>
                 <div class="pickup-code-lg" id="bannerPickupNo">----</div>
@@ -820,7 +944,6 @@ def index_html():
                 el.classList.add('active');
             }}
 
-            // 0ms 即时响应下单
             async function doSubmit() {{
                 const name = document.getElementById('userName').value.trim();
                 const remark = document.getElementById('remark').value.trim();
@@ -838,7 +961,6 @@ def index_html():
                 localStorage.setItem('coffee_user_name', name);
                 document.getElementById('queryName').value = name;
 
-                // 0ms 视觉反馈
                 btn.disabled = true;
                 btnSpinner.style.display = 'block';
                 btnText.innerText = '正在向咖啡厅下单...';
@@ -849,7 +971,7 @@ def index_html():
                 document.getElementById('bannerPickupNo').innerText = '...';
                 document.getElementById('bannerStatusText').innerText = '提交中';
                 document.getElementById('bannerStatusText').style.color = '#646A73';
-                document.getElementById('bannerDesc').innerText = '正在为您分配取餐码与扣减R豆...';
+                document.getElementById('bannerDesc').innerText = '正在为您分配取餐码...';
 
                 try {{
                     const res = await fetch('/api/order', {{
@@ -937,7 +1059,6 @@ def index_html():
                 }}
             }}
 
-            // 获取订单列表
             async function fetchOrders(showLoading = false) {{
                 const listEl = document.getElementById('ordersList');
                 if (showLoading && allOrdersCache.length === 0) {{
@@ -956,7 +1077,6 @@ def index_html():
                 }}
             }}
 
-            // 实时即时输入响应
             function onSearchInput() {{
                 const val = document.getElementById('queryName').value.trim();
                 document.getElementById('clearSearchBtn').style.display = val ? 'block' : 'none';
@@ -970,7 +1090,6 @@ def index_html():
                 document.getElementById('queryName').focus();
             }}
 
-            // 本地毫秒级实时渲染
             function renderFilteredOrders() {{
                 const keyword = document.getElementById('queryName').value.trim().toLowerCase();
                 const listEl = document.getElementById('ordersList');

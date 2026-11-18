@@ -15,6 +15,9 @@ HOST = os.getenv("HOST", "0.0.0.0")
 MAX_ORDERS_PER_PERSON_DAILY = int(os.getenv("MAX_ORDERS_PER_PERSON_DAILY", "2"))
 ALLOW_ORDERING = os.getenv("ALLOW_ORDERING", "true").lower() in ("true", "1", "yes")
 
+# 测试/演练模式 (开启时不向真实咖啡接口下单，不扣R豆)
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes")
+
 # 飞书多维表格通知 Webhook
 FEISHU_NOTIFY_WEBHOOK = os.getenv("FEISHU_NOTIFY_WEBHOOK", "https://reachauto.feishu.cn/base/workflow/webhook/event/ZaoIa3r7gwGqqthZRmcclb0cn1e")
 
