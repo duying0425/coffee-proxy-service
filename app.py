@@ -3,7 +3,7 @@ R Cafe 开放点单服务主程序 (FastAPI)
 包含：
 1. 紧凑型双通道引导（精简顶部通知条，释放首屏空间）
 2. 0ms 即时触觉反馈 + 按钮加载动效 + 实时出单骨架卡片
-3. 性能优化：剔除多余的二次查询，下单耗时降低 50%+
+3. 制作进度 / 记录页面：输入花名/取餐码实时即时筛选（无需手动点查询）
 4. 飞书多维表格 / 自定义 Webhook 自动化点单
 5. 后台自动巡检与飞书取餐就绪 Webhook 推送
 """
@@ -298,7 +298,7 @@ async def handle_feishu_webhook(request: Request):
 
 @app.get("/", response_class=HTMLResponse)
 def index_html():
-    """紧凑现代化响应式前台（精简顶栏 + 0ms 触控即时反馈 + 实时出餐动效）"""
+    """紧凑现代化响应式前台（实时即时筛选 + 0ms 触控即时反馈 + 实时出餐动效）"""
     return f"""
     <!DOCTYPE html>
     <html lang="zh-CN">
@@ -334,7 +334,7 @@ def index_html():
                 width: 100%;
             }}
 
-            /* 1. 紧凑型顶部飞书胶囊条（仅占 36px，释放首屏） */
+            /* 1. 紧凑型顶部飞书胶囊条 */
             .compact-feishu-bar {{
                 display: flex;
                 align-items: center;
@@ -514,7 +514,6 @@ def index_html():
                 box-shadow: none;
             }}
 
-            /* 按钮内置 Spinner */
             .spinner {{
                 width: 16px;
                 height: 16px;
@@ -604,6 +603,7 @@ def index_html():
                 padding: 12px;
                 margin-bottom: 10px;
                 background: #FFF;
+                transition: transform 0.15s ease;
             }}
             .order-top {{
                 display: flex;
@@ -617,11 +617,56 @@ def index_html():
                 font-size: 11.5px;
                 font-weight: 600;
             }}
+
+            /* 实时搜索框与操作区 */
+            .search-box-wrapper {{
+                display: flex;
+                gap: 8px;
+                align-items: center;
+            }}
+            .search-input-rel {{
+                position: relative;
+                flex: 1;
+            }}
+            .clear-icon {{
+                position: absolute;
+                right: 10px;
+                top: 50%;
+                transform: translateY(-50%);
+                cursor: pointer;
+                color: #999;
+                font-size: 17px;
+                display: none;
+                width: 20px;
+                height: 20px;
+                line-height: 18px;
+                text-align: center;
+                border-radius: 50%;
+                background: #EAECEF;
+            }}
+            .btn-refresh {{
+                padding: 10px 12px;
+                background: #FFF;
+                color: var(--text-main);
+                border: 1.5px solid var(--border);
+                border-radius: 8px;
+                font-size: 13px;
+                font-weight: 600;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                white-space: nowrap;
+                transition: all 0.15s ease;
+            }}
+            .btn-refresh:active {{
+                background: #E8ECEF;
+            }}
         </style>
     </head>
     <body>
         <div class="container">
-            <!-- 1. 超精简飞书通道胶囊条（仅 36px 高，点缀式引导） -->
+            <!-- 1. 紧凑型飞书通道胶囊条 -->
             <div class="compact-feishu-bar">
                 <div>
                     <span class="pill-tag">飞书实名</span>
@@ -694,13 +739,17 @@ def index_html():
                 </div>
             </div>
 
-            <!-- 5. 进度 / 记录面板 -->
+            <!-- 5. 进度 / 记录面板（带实时即时输入筛选） -->
             <div id="panelStatus" style="display: none;">
-                <div class="card" style="margin-bottom: 10px; padding: 14px;">
-                    <div style="font-size: 13.5px; font-weight: 600; margin-bottom: 6px;">快速查询订单</div>
-                    <div style="display: flex; gap: 8px;">
-                        <input type="text" id="queryName" placeholder="输入花名或取餐码" style="flex: 1;">
-                        <button onclick="queryMyOrders()" style="padding: 0 14px; background: var(--primary); color: #FFF; border: none; border-radius: 8px; font-weight: 600; cursor: pointer;">查询</button>
+                <div class="card" style="margin-bottom: 10px; padding: 12px 14px;">
+                    <div class="search-box-wrapper">
+                        <div class="search-input-rel">
+                            <input type="text" id="queryName" placeholder="输入花名、取餐号实时筛选..." oninput="onSearchInput()" autocomplete="off">
+                            <span class="clear-icon" id="clearSearchBtn" onclick="clearSearch()">&times;</span>
+                        </div>
+                        <button class="btn-refresh" onclick="fetchOrders(true)">
+                            <span id="refreshIcon">🔄</span> 刷新
+                        </button>
                     </div>
                 </div>
 
@@ -732,6 +781,7 @@ def index_html():
             let activeOrderNo = localStorage.getItem('last_order_no') || null;
             let activePickupNo = localStorage.getItem('last_pickup_no') || null;
             let pollingTimer = null;
+            let allOrdersCache = [];
 
             const savedName = localStorage.getItem('coffee_user_name');
             if (savedName) {{
@@ -754,7 +804,7 @@ def index_html():
                     document.getElementById('tabOrder').classList.remove('active');
                     document.getElementById('panelOrder').style.display = 'none';
                     document.getElementById('panelStatus').style.display = 'block';
-                    queryMyOrders();
+                    fetchOrders(true);
                 }}
             }}
 
@@ -786,13 +836,13 @@ def index_html():
                 }}
 
                 localStorage.setItem('coffee_user_name', name);
+                document.getElementById('queryName').value = name;
 
-                // 【0ms 视觉即时反馈】按钮立即进入出单动效
+                // 0ms 视觉反馈
                 btn.disabled = true;
                 btnSpinner.style.display = 'block';
                 btnText.innerText = '正在向咖啡厅下单...';
 
-                // 同时下方卡片立即以骨架动画展开，告知用户系统正在处理，无卡顿感
                 banner.className = 'status-banner submitting';
                 banner.style.display = 'block';
                 document.getElementById('bannerTitle').innerText = '☕ 正在连接咖啡厅出餐系统...';
@@ -820,7 +870,6 @@ def index_html():
                     localStorage.setItem('last_order_no', activeOrderNo);
                     localStorage.setItem('last_pickup_no', activePickupNo);
 
-                    // 切换为真实取餐卡片并开启轮询
                     startPollingStatus(activeOrderNo, activePickupNo);
                 }} catch (e) {{
                     banner.style.display = 'none';
@@ -888,49 +937,79 @@ def index_html():
                 }}
             }}
 
-            async function queryMyOrders() {{
-                const keyword = document.getElementById('queryName').value.trim();
+            // 获取订单列表
+            async function fetchOrders(showLoading = false) {{
                 const listEl = document.getElementById('ordersList');
-                listEl.innerHTML = '<div style="text-align:center; color:#888; padding:20px;">正在获取订单列表...</div>';
+                if (showLoading && allOrdersCache.length === 0) {{
+                    listEl.innerHTML = '<div style="text-align:center; color:#888; padding:20px;">正在获取订单列表...</div>';
+                }}
 
                 try {{
                     const res = await fetch('/api/orders/my');
                     const data = await res.json();
-                    const items = data.items || [];
-
-                    let filtered = items;
-                    if (keyword) {{
-                        filtered = items.filter(it => 
-                            (it.remark && it.remark.includes(keyword)) ||
-                            it.pickupNo === keyword ||
-                            it.orderNo === keyword
-                        );
-                    }}
-
-                    if (filtered.length === 0) {{
-                        listEl.innerHTML = `<div style="text-align:center; color:#888; padding:30px;">未找到与 "${{keyword}}" 相关的订单</div>`;
-                        return;
-                    }}
-
-                    let html = '';
-                    filtered.slice(0, 15).forEach(it => {{
-                        const productInfo = it.items && it.items[0] ? `${{it.items[0].productName}} (${{it.items[0].specInfo || ''}})` : '咖啡';
-                        html += `
-                        <div class="order-item-card">
-                            <div class="order-top">
-                                <span style="font-size: 18px; font-weight: 800; color: var(--primary);">取餐号: ${{it.pickupNo}}</span>
-                                <span class="status-tag" style="background: ${{it.statusColor}}20; color: ${{it.statusColor}};">${{it.statusText}}</span>
-                            </div>
-                            <div style="font-size: 13.5px; font-weight: 600; margin-bottom: 3px;">${{productInfo}}</div>
-                            <div style="font-size: 12px; color: #555;">${{it.remark || '无备注'}}</div>
-                            <div style="font-size: 11px; color: #999; margin-top: 5px;">下单时间: ${{new Date(it.createdAt).toLocaleTimeString()}} · 状态: ${{it.statusDesc}}</div>
-                        </div>
-                        `;
-                    }});
-                    listEl.innerHTML = html;
+                    allOrdersCache = data.items || [];
+                    renderFilteredOrders();
                 }} catch (e) {{
-                    listEl.innerHTML = `<div style="color:red; text-align:center; padding:20px;">加载失败: ${{e.message}}</div>`;
+                    if (allOrdersCache.length === 0) {{
+                        listEl.innerHTML = `<div style="color:red; text-align:center; padding:20px;">加载失败: ${{e.message}}</div>`;
+                    }}
                 }}
+            }}
+
+            // 实时即时输入响应
+            function onSearchInput() {{
+                const val = document.getElementById('queryName').value.trim();
+                document.getElementById('clearSearchBtn').style.display = val ? 'block' : 'none';
+                renderFilteredOrders();
+            }}
+
+            function clearSearch() {{
+                document.getElementById('queryName').value = '';
+                document.getElementById('clearSearchBtn').style.display = 'none';
+                renderFilteredOrders();
+                document.getElementById('queryName').focus();
+            }}
+
+            // 本地毫秒级实时渲染
+            function renderFilteredOrders() {{
+                const keyword = document.getElementById('queryName').value.trim().toLowerCase();
+                const listEl = document.getElementById('ordersList');
+                const clearBtn = document.getElementById('clearSearchBtn');
+                if (clearBtn) clearBtn.style.display = keyword ? 'block' : 'none';
+
+                let filtered = allOrdersCache;
+                if (keyword) {{
+                    filtered = allOrdersCache.filter(it => {{
+                        const remark = (it.remark || '').toLowerCase();
+                        const pickupNo = (it.pickupNo || '').toLowerCase();
+                        const orderNo = (it.orderNo || '').toLowerCase();
+                        const prodName = it.items && it.items[0] ? (it.items[0].productName || '').toLowerCase() : '';
+                        const statusText = (it.statusText || '').toLowerCase();
+                        return remark.includes(keyword) || pickupNo.includes(keyword) || orderNo.includes(keyword) || prodName.includes(keyword) || statusText.includes(keyword);
+                    }});
+                }}
+
+                if (filtered.length === 0) {{
+                    listEl.innerHTML = `<div style="text-align:center; color:#888; padding:30px;">未找到匹配 "${{keyword}}" 的订单</div>`;
+                    return;
+                }}
+
+                let html = '';
+                filtered.slice(0, 30).forEach(it => {{
+                    const productInfo = it.items && it.items[0] ? `${{it.items[0].productName}} (${{it.items[0].specInfo || ''}})` : '咖啡';
+                    html += `
+                    <div class="order-item-card">
+                        <div class="order-top">
+                            <span style="font-size: 18px; font-weight: 800; color: var(--primary);">取餐号: ${{it.pickupNo}}</span>
+                            <span class="status-tag" style="background: ${{it.statusColor}}20; color: ${{it.statusColor}};">${{it.statusText}}</span>
+                        </div>
+                        <div style="font-size: 13.5px; font-weight: 600; margin-bottom: 3px;">${{productInfo}}</div>
+                        <div style="font-size: 12px; color: #555;">${{it.remark || '无备注'}}</div>
+                        <div style="font-size: 11px; color: #999; margin-top: 5px;">下单时间: ${{new Date(it.createdAt).toLocaleTimeString()}} · 状态: ${{it.statusDesc}}</div>
+                    </div>
+                    `;
+                }});
+                listEl.innerHTML = html;
             }}
         </script>
     </body>
