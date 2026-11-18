@@ -663,12 +663,28 @@ def index_html():
             }}
 
             .status-banner {{
+                position: relative;
                 border-radius: 12px;
                 padding: 16px;
                 margin-top: 12px;
                 text-align: center;
                 display: none;
                 transition: all 0.3s ease;
+            }}
+            .status-banner .card-close {{
+                position: absolute;
+                top: 8px;
+                right: 12px;
+                font-size: 20px;
+                color: #94A3B8;
+                cursor: pointer;
+                line-height: 1;
+                padding: 2px 6px;
+                border-radius: 4px;
+            }}
+            .status-banner .card-close:hover {{
+                color: #475569;
+                background: rgba(0, 0, 0, 0.05);
             }}
             .status-banner.submitting {{
                 background: #F8FAFC;
@@ -864,6 +880,23 @@ def index_html():
                         <div class="spinner" id="btnSpinner"></div>
                         <span id="btnText">立即下单</span>
                     </button>
+
+                    <!-- 出单进度卡片：仅在当前点单 Tab 内展示 -->
+                    <div class="status-banner" id="liveStatusCard">
+                        <span class="card-close" onclick="dismissLiveCard()" title="关闭进度卡片">&times;</span>
+                        <div class="pickup-badge-title" id="bannerTitle">订单提交中...</div>
+                        <div class="pickup-code-lg" id="bannerPickupNo">----</div>
+                        <div id="bannerStatusText" style="font-size: 15px; font-weight: 700; margin-bottom: 4px;"></div>
+                        <div id="bannerDesc" style="font-size: 12.5px; color: #555;"></div>
+
+                        <div class="stepper">
+                            <div class="step-item" id="step1"><div class="step-circle">1</div>待制作</div>
+                            <div class="step-item" id="step2"><div class="step-circle">2</div>制作中</div>
+                            <div class="step-item" id="step3"><div class="step-circle">3</div>餐好待取</div>
+                            <div class="step-item" id="step4"><div class="step-circle">4</div>已取餐</div>
+                        </div>
+                        <div style="font-size: 11.5px; color: #8F959E; margin-top: 8px;">⚡ 页面每 8 秒自动轮询，咖啡做好将变绿提醒</div>
+                    </div>
                 </div>
             </div>
 
@@ -883,21 +916,6 @@ def index_html():
                 <div id="ordersList">
                     <div style="text-align: center; color: #888; font-size: 13px; padding: 20px;">正在加载订单进度...</div>
                 </div>
-            </div>
-
-            <div class="status-banner" id="liveStatusCard">
-                <div class="pickup-badge-title" id="bannerTitle">订单提交中...</div>
-                <div class="pickup-code-lg" id="bannerPickupNo">----</div>
-                <div id="bannerStatusText" style="font-size: 15px; font-weight: 700; margin-bottom: 4px;"></div>
-                <div id="bannerDesc" style="font-size: 12.5px; color: #555;"></div>
-
-                <div class="stepper">
-                    <div class="step-item" id="step1"><div class="step-circle">1</div>待制作</div>
-                    <div class="step-item" id="step2"><div class="step-circle">2</div>制作中</div>
-                    <div class="step-item" id="step3"><div class="step-circle">3</div>餐好待取</div>
-                    <div class="step-item" id="step4"><div class="step-circle">4</div>已取餐</div>
-                </div>
-                <div style="font-size: 11.5px; color: #8F959E; margin-top: 8px;">⚡ 页面每 8 秒自动轮询，咖啡做好将变绿提醒</div>
             </div>
         </div>
 
@@ -1013,10 +1031,19 @@ def index_html():
                 }}
             }}
 
+            function dismissLiveCard() {{
+                const banner = document.getElementById('liveStatusCard');
+                if (banner) banner.style.display = 'none';
+                if (pollingTimer) clearInterval(pollingTimer);
+                localStorage.removeItem('last_order_no');
+                localStorage.removeItem('last_pickup_no');
+            }}
+
             function startPollingStatus(orderNo, pickupNo) {{
                 const banner = document.getElementById('liveStatusCard');
                 banner.style.display = 'block';
                 document.getElementById('bannerPickupNo').innerText = pickupNo || '----';
+                document.getElementById('bannerTitle').innerText = '☕ 正在同步制作进度...';
 
                 if (pollingTimer) clearInterval(pollingTimer);
                 checkStatus(orderNo, pickupNo);
@@ -1027,9 +1054,14 @@ def index_html():
                 try {{
                     const res = await fetch(`/api/order/status?order_no=${{encodeURIComponent(orderNo)}}&pickup_no=${{encodeURIComponent(pickupNo)}}`);
                     const data = await res.json();
-                    if (!data.found) return;
-
                     const banner = document.getElementById('liveStatusCard');
+
+                    if (!data || !data.found) {{
+                        // 未查询到有效订单（如旧测试单或已失效单）-> 立即清空缓存并隐藏
+                        dismissLiveCard();
+                        return;
+                    }}
+
                     const textEl = document.getElementById('bannerStatusText');
                     const descEl = document.getElementById('bannerDesc');
                     const titleEl = document.getElementById('bannerTitle');
