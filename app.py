@@ -1,7 +1,7 @@
 """
 R Cafe 开放点单服务主程序 (FastAPI)
 包含：
-1. 测试/演练模式 (DRY_RUN)：不向真实系统扣豆下单，10秒后自动触发完成通知，全链路测试多维表格
+1. 测试/演练模式 (DRY_RUN)：不向真实系统扣豆下单，10秒后自动触发完成通知，全链路测试多维表格与网页点单
 2. 紧凑型双通道引导（精简顶部通知条，释放首屏空间）
 3. 0ms 即时触觉反馈 + 按钮加载动效 + 实时出单骨架卡片
 4. 制作进度 / 记录页面：输入花名/取餐码实时即时筛选（无需手动点查询）
@@ -14,7 +14,7 @@ import random
 import asyncio
 from datetime import datetime
 from typing import Optional, Any, Dict, List
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
@@ -144,7 +144,6 @@ def handle_dry_run_order(user_name: str, product_str: str, temp_str: str, remark
     pickup_no = f"T{random.randint(101, 899)}"
     order_no = f"TEST{datetime.now().strftime('%m%d%H%M%S')}"
     
-    # 规整商品名
     p_name = "拿铁" if "拿铁" in product_str or "latte" in product_str.lower() else "美式咖啡"
     t_name = "冰饮" if any(x in temp_str for x in ["冰", "冷", "ice", "cold"]) else "热饮"
 
@@ -169,8 +168,6 @@ def handle_dry_run_order(user_name: str, product_str: str, temp_str: str, remark
     }
 
     mock_orders_cache[order_no] = res_data
-    # 启动 10 秒后模拟出餐并向飞书推送
-    asyncio.create_task(simulate_mock_order_ready(order_no, pickup_no, user_name, p_name, t_name))
     return res_data
 
 
@@ -210,7 +207,6 @@ def get_my_orders():
         data = client.get_my_orders()
         items = data.get("items", [])
         
-        # 将正在进行的测试单合并在最前列
         for mock_item in list(mock_orders_cache.values())[::-1]:
             items.insert(0, {
                 "orderNo": mock_item["orderNo"],
@@ -295,8 +291,8 @@ def get_order_status(order_no: Optional[str] = None, pickup_no: Optional[str] = 
 
 
 @app.post("/api/order")
-def submit_order_web(order: OrderSubmitReq):
-    """Web 界面下单接口"""
+async def submit_order_web(order: OrderSubmitReq):
+    """Web 界面下单接口（转为 async def 避免线程池无 event_loop 报错）"""
     if not config.ALLOW_ORDERING:
         raise HTTPException(status_code=400, detail="服务当前已暂停接单")
 
@@ -304,7 +300,6 @@ def submit_order_web(order: OrderSubmitReq):
     if not user_name:
         raise HTTPException(status_code=400, detail="请输入您的姓名或花名")
 
-    # 判断是否为测试模式
     is_mock = config.DRY_RUN or any(x in user_name for x in ["测试", "test", "Test"])
     if is_mock:
         res = handle_dry_run_order(
@@ -313,6 +308,8 @@ def submit_order_web(order: OrderSubmitReq):
             temp_str=order.temp,
             remark_str=order.remark
         )
+        # 10秒后自动触发完成通知
+        asyncio.create_task(simulate_mock_order_ready(res["orderNo"], res["pickupNo"], user_name, res["productName"], res["temp"]))
         return {
             "status": "success",
             "message": "【测试演练成功】已生成模拟取餐号，10秒后将自动模拟出餐通知",
@@ -387,7 +384,6 @@ async def handle_feishu_webhook(request: Request):
     if remark:
         remark = str(remark).strip()
 
-    # 判断是否为测试/演练模式
     is_mock = config.DRY_RUN or data.get("dry_run") is True or any(x in user_name for x in ["测试", "test", "Test"])
     if is_mock:
         print(f"[Webhook] 收到飞书测试演练点单: {user_name} - {product} ({temp})")
@@ -397,6 +393,7 @@ async def handle_feishu_webhook(request: Request):
             temp_str=temp,
             remark_str=remark
         )
+        asyncio.create_task(simulate_mock_order_ready(res["orderNo"], res["pickupNo"], user_name, res["productName"], res["temp"]))
         return {
             "status": "success",
             "code": 0,
@@ -984,8 +981,16 @@ def index_html():
                             remark: remark
                         }})
                     }});
-                    const data = await res.json();
-                    if (!res.ok) throw new Error(data.detail || data.error || '下单失败');
+                    
+                    let data;
+                    const resText = await res.text();
+                    try {{
+                        data = JSON.parse(resText);
+                    }} catch(e) {{
+                        throw new Error(resText || '服务器内部错误');
+                    }}
+
+                    if (!res.ok) throw new Error(data.detail || data.error || data.message || '下单失败');
 
                     activeOrderNo = data.orderNo;
                     activePickupNo = data.pickupNo;
