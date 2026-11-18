@@ -14,3 +14,6 @@ HOST = os.getenv("HOST", "0.0.0.0")
 # 风控与配额
 MAX_ORDERS_PER_PERSON_DAILY = int(os.getenv("MAX_ORDERS_PER_PERSON_DAILY", "2"))
 ALLOW_ORDERING = os.getenv("ALLOW_ORDERING", "true").lower() in ("true", "1", "yes")
+
+# 飞书多维表格取餐就绪通知 Webhook
+FEISHU_NOTIFY_WEBHOOK = os.getenv("FEISHU_NOTIFY_WEBHOOK", "https://reachauto.feishu.cn/base/workflow/webhook/event/ZaoIa3r7gwGqqthZRmcclb0cn1e")

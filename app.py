@@ -4,13 +4,13 @@ R Cafe 开放点单服务主程序 (FastAPI)
 1. 响应式 Web 点单界面 + 实时进度轮询（排队 -> 制作中 -> 待取餐 -> 已完成）
 2. 本地历史订单追踪（关闭网页后重新打开仍能查询）
 3. 飞书多维表格 / 自定义 Webhook 自动化点单
-4. 可选：飞书群机器人取餐就绪自动推送
+4. 后台自动巡检与飞书取餐就绪 Webhook 推送
 """
 import os
 import json
 import asyncio
 from typing import Optional, Any, Dict, List
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
@@ -37,8 +37,77 @@ STATUS_MAP = {
     "cancelled": {"text": "已取消", "color": "#E5484D", "desc": "订单已取消，R豆已原路退回"}
 }
 
-# 缓存已通知过的订单ID，避免飞书群重复提醒
+# 记录已推送过通知的订单编号，避免重复提醒
 notified_ready_orders = set()
+
+
+@app.on_event("startup")
+async def startup_event():
+    """服务启动时，初始化后台监听任务"""
+    asyncio.create_task(order_status_monitor_loop())
+
+
+async def order_status_monitor_loop():
+    """后台任务：每 15 秒轮询一次，发现订单餐好自动推送飞书 Webhook"""
+    print("[Monitor] 启动后台订单状态监听巡检...")
+    try:
+        # 先记录下历史已做完的订单，防止重启时重复推送
+        init_data = client.get_my_orders()
+        for item in init_data.get("items", []):
+            if item.get("status") in ("ready", "completed"):
+                notified_ready_orders.add(item.get("orderNo"))
+        print(f"[Monitor] 已初始化历史订单缓存: {len(notified_ready_orders)} 笔")
+    except Exception as e:
+        print(f"[Monitor] 初始化订单缓存异常: {e}")
+
+    while True:
+        await asyncio.sleep(15)
+        if not config.FEISHU_NOTIFY_WEBHOOK:
+            continue
+        try:
+            data = client.get_my_orders()
+            items = data.get("items", [])
+            for item in items:
+                order_no = item.get("orderNo")
+                status = item.get("status")
+                
+                # 当订单为 ready（餐好）或刚完成，且尚未推送过时
+                if status in ("ready", "completed") and order_no not in notified_ready_orders:
+                    # 提取同事名字
+                    remark = item.get("remark") or ""
+                    colleague = "同事"
+                    if "点单人:" in remark:
+                        colleague = remark.split("点单人:")[1].split("(")[0].strip()
+                    elif remark:
+                        colleague = remark.strip()
+
+                    product_name = "咖啡"
+                    spec_info = ""
+                    if item.get("items") and len(item["items"]) > 0:
+                        first_prod = item["items"][0]
+                        product_name = first_prod.get("productName", "咖啡")
+                        spec_info = first_prod.get("specInfo", "")
+
+                    pickup_no = item.get("pickupNo", "")
+
+                    payload = {
+                        "pickup_no": pickup_no,
+                        "order_no": order_no,
+                        "colleague": colleague,
+                        "product": product_name,
+                        "spec": spec_info,
+                        "status": "待取餐",
+                        "message": f"☕ 您的 {product_name} 已做好！取餐码为 {pickup_no}，请尽快前往咖啡厅吧台领取！"
+                    }
+                    try:
+                        resp = requests.post(config.FEISHU_NOTIFY_WEBHOOK, json=payload, timeout=8)
+                        print(f"[Monitor] 触发飞书通知: {order_no} ({pickup_no}), 响应: {resp.text}")
+                        notified_ready_orders.add(order_no)
+                    except Exception as post_err:
+                        print(f"[Monitor] 推送飞书通知失败: {post_err}")
+        except Exception as poll_err:
+            print(f"[Monitor] 轮询订单异常: {poll_err}")
+
 
 class OrderSubmitReq(BaseModel):
     user_name: str
@@ -72,7 +141,6 @@ def get_my_orders():
     """获取最新点单列表与取餐状态"""
     try:
         data = client.get_my_orders()
-        # 补充易读的状态中文
         for item in data.get("items", []):
             st = item.get("status", "unknown")
             info = STATUS_MAP.get(st, {"text": st, "color": "#888", "desc": ""})
@@ -86,9 +154,7 @@ def get_my_orders():
 
 @app.get("/api/order/status")
 def get_order_status(order_no: Optional[str] = None, pickup_no: Optional[str] = None, user_name: Optional[str] = None):
-    """
-    单单查询或按姓名查询最新订单进度
-    """
+    """单单查询或按姓名查询最新订单进度"""
     try:
         data = client.get_my_orders()
         items = data.get("items", [])
@@ -377,7 +443,6 @@ def index_html():
                 cursor: not-allowed;
                 box-shadow: none;
             }
-            /* 实时进度卡片 */
             .status-banner {
                 border-radius: 14px;
                 padding: 16px;
@@ -470,13 +535,11 @@ def index_html():
                 <div class="brand-sub">姓名自动上贴 · 实时查询制作进度</div>
             </div>
 
-            <!-- Tab 切换 -->
             <div class="nav-tabs">
                 <div class="nav-tab active" id="tabOrder" onclick="switchTab('order')">我要点单</div>
                 <div class="nav-tab" id="tabStatus" onclick="switchTab('status')">点单进度 / 记录</div>
             </div>
 
-            <!-- Tab 1: 点单面板 -->
             <div id="panelOrder">
                 <div class="card">
                     <div class="form-item">
@@ -521,7 +584,6 @@ def index_html():
                 </div>
             </div>
 
-            <!-- Tab 2: 进度 / 记录面板 -->
             <div id="panelStatus" style="display: none;">
                 <div class="card" style="margin-bottom: 12px; padding: 16px;">
                     <div style="font-size: 14px; font-weight: 600; margin-bottom: 8px;">快速查询我的点单</div>
@@ -536,14 +598,12 @@ def index_html():
                 </div>
             </div>
 
-            <!-- 动态弹出的即时状态卡片（在点单面板下方展示） -->
             <div class="status-banner" id="liveStatusCard">
                 <div class="pickup-badge-title" id="bannerTitle">订单提交中...</div>
                 <div class="pickup-code-lg" id="bannerPickupNo">----</div>
                 <div id="bannerStatusText" style="font-size: 16px; font-weight: 700; margin-bottom: 6px;"></div>
                 <div id="bannerDesc" style="font-size: 13px; color: #555;"></div>
 
-                <!-- 进度条 -->
                 <div class="stepper">
                     <div class="step-item" id="step1"><div class="step-circle">1</div>待制作</div>
                     <div class="step-item" id="step2"><div class="step-circle">2</div>制作中</div>
@@ -561,14 +621,12 @@ def index_html():
             let activePickupNo = localStorage.getItem('last_pickup_no') || null;
             let pollingTimer = null;
 
-            // 页面初始化恢复已存姓名
             const savedName = localStorage.getItem('coffee_user_name');
             if (savedName) {
                 document.getElementById('userName').value = savedName;
                 document.getElementById('queryName').value = savedName;
             }
 
-            // 如果有尚未完成的活跃订单，自动轮询它
             if (activeOrderNo) {
                 startPollingStatus(activeOrderNo, activePickupNo);
             }
@@ -668,7 +726,6 @@ def index_html():
                     textEl.style.color = data.statusColor;
                     descEl.innerText = data.statusDesc;
 
-                    // 重置步骤样式
                     ['step1', 'step2', 'step3', 'step4'].forEach(id => document.getElementById(id).classList.remove('active'));
 
                     if (data.status === 'pending') {
