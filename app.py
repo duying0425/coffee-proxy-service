@@ -481,17 +481,6 @@ def index_html():
                 padding: 16px 16px 14px 16px;
                 margin-bottom: 14px;
                 box-shadow: 0 4px 14px rgba(51, 112, 255, 0.08);
-                position: relative;
-                overflow: hidden;
-            }}
-            .feishu-hero-card::after {{
-                content: "☕";
-                position: absolute;
-                right: -8px;
-                bottom: -10px;
-                font-size: 72px;
-                opacity: 0.12;
-                pointer-events: none;
             }}
             .hero-badge-row {{
                 display: flex;
