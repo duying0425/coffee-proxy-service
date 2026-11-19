@@ -828,6 +828,49 @@ def index_html():
                 font-weight: 600;
             }}
 
+            .order-group-header {{
+                font-size: 13px;
+                font-weight: 700;
+                color: #475569;
+                margin: 6px 0 8px 2px;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }}
+            .history-collapse-bar {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                background: #F1F5F9;
+                border: 1px solid #E2E8F0;
+                border-radius: 10px;
+                padding: 10px 14px;
+                margin: 14px 0 10px 0;
+                cursor: pointer;
+                transition: background 0.15s ease;
+                user-select: none;
+            }}
+            .history-collapse-bar:hover {{
+                background: #E2E8F0;
+            }}
+            .history-bar-title {{
+                font-size: 13px;
+                font-weight: 700;
+                color: #334155;
+            }}
+            .history-bar-count {{
+                font-size: 12px;
+                color: #64748B;
+            }}
+            .history-toggle-action {{
+                font-size: 12px;
+                color: #2563EB;
+                font-weight: 600;
+                display: flex;
+                align-items: center;
+                gap: 4px;
+            }}
+
             .search-box-wrapper {{
                 display: flex;
                 gap: 8px;
@@ -1211,6 +1254,61 @@ def index_html():
                 document.getElementById('queryName').focus();
             }}
 
+            let historyExpanded = false;
+
+            function isOrderToday(dateStr) {{
+                if (!dateStr) return false;
+                const d = new Date(dateStr);
+                if (isNaN(d.getTime())) return false;
+                return d.toDateString() === (new Date()).toDateString();
+            }}
+
+            function formatOrderTime(dateStr) {{
+                if (!dateStr) return '';
+                const d = new Date(dateStr);
+                if (isNaN(d.getTime())) return dateStr;
+                const now = new Date();
+                const isCurrent = d.toDateString() === now.toDateString();
+                const timeStr = d.toLocaleTimeString([], {{ hour: '2-digit', minute: '2-digit', second: '2-digit' }});
+                if (isCurrent) {{
+                    return `今天 ${{timeStr}}`;
+                }}
+                const yesterday = new Date(now);
+                yesterday.setDate(yesterday.getDate() - 1);
+                if (d.toDateString() === yesterday.toDateString()) {{
+                    return `昨天 ${{timeStr}}`;
+                }}
+                const month = (d.getMonth() + 1).toString().padStart(2, '0');
+                const day = d.getDate().toString().padStart(2, '0');
+                return `${{month}}-${{day}} ${{timeStr}}`;
+            }}
+
+            function toggleHistoryOrders() {{
+                historyExpanded = !historyExpanded;
+                const box = document.getElementById('historyOrdersBox');
+                const icon = document.getElementById('historyToggleIcon');
+                const text = document.getElementById('historyToggleText');
+                if (box) box.style.display = historyExpanded ? 'block' : 'none';
+                if (icon) icon.innerText = historyExpanded ? '▲' : '▼';
+                if (text) text.innerText = historyExpanded ? '收起' : '展开查看';
+            }}
+
+            function renderOrderCard(it) {{
+                const productInfo = it.items && it.items[0] ? `${{it.items[0].productName}} (${{it.items[0].specInfo || ''}})` : '咖啡';
+                const timeFormatted = formatOrderTime(it.createdAt);
+                return `
+                <div class="order-item-card">
+                    <div class="order-top">
+                        <span style="font-size: 18px; font-weight: 800; color: var(--primary);">取餐号: ${{it.pickupNo}}</span>
+                        <span class="status-tag" style="background: ${{it.statusColor}}20; color: ${{it.statusColor}};">${{it.statusText}}</span>
+                    </div>
+                    <div style="font-size: 13.5px; font-weight: 600; margin-bottom: 3px;">${{productInfo}}</div>
+                    <div style="font-size: 12px; color: #555;">${{it.remark || '无备注'}}</div>
+                    <div style="font-size: 11px; color: #999; margin-top: 5px;">下单时间: ${{timeFormatted}} · 状态: ${{it.statusDesc}}</div>
+                </div>
+                `;
+            }}
+
             function renderFilteredOrders() {{
                 const keyword = document.getElementById('queryName').value.trim().toLowerCase();
                 const listEl = document.getElementById('ordersList');
@@ -1234,21 +1332,49 @@ def index_html():
                     return;
                 }}
 
+                const todayOrders = [];
+                const historyOrders = [];
+
+                filtered.forEach(it => {{
+                    if (isOrderToday(it.createdAt)) {{
+                        todayOrders.push(it);
+                    }} else {{
+                        historyOrders.push(it);
+                    }}
+                }});
+
                 let html = '';
-                filtered.slice(0, 30).forEach(it => {{
-                    const productInfo = it.items && it.items[0] ? `${{it.items[0].productName}} (${{it.items[0].specInfo || ''}})` : '咖啡';
+
+                // 今日订单区
+                if (todayOrders.length > 0) {{
+                    html += `<div class="order-group-header"><span>☕ 今日订单</span><span style="font-size: 11.5px; color: #64748B; font-weight: 500;">（共 ${{todayOrders.length}} 单）</span></div>`;
+                    todayOrders.forEach(it => {{
+                        html += renderOrderCard(it);
+                    }});
+                }} else if (!keyword) {{
+                    html += `<div style="text-align: center; color: #94A3B8; font-size: 13px; padding: 22px 0; background: #FFF; border-radius: 10px; border: 1.5px dashed var(--border); margin-bottom: 12px;">☕ 今日吧台暂无新点单</div>`;
+                }}
+
+                // 往日历史订单区 (默认折叠，若正在搜索则自动展开)
+                if (historyOrders.length > 0) {{
+                    const shouldShowHistory = keyword ? true : historyExpanded;
                     html += `
-                    <div class="order-item-card">
-                        <div class="order-top">
-                            <span style="font-size: 18px; font-weight: 800; color: var(--primary);">取餐号: ${{it.pickupNo}}</span>
-                            <span class="status-tag" style="background: ${{it.statusColor}}20; color: ${{it.statusColor}};">${{it.statusText}}</span>
+                    <div class="history-collapse-bar" onclick="toggleHistoryOrders()">
+                        <div>
+                            <span class="history-bar-title">📦 往日历史订单</span>
+                            <span class="history-bar-count">（共 ${{historyOrders.length}} 单）</span>
                         </div>
-                        <div style="font-size: 13.5px; font-weight: 600; margin-bottom: 3px;">${{productInfo}}</div>
-                        <div style="font-size: 12px; color: #555;">${{it.remark || '无备注'}}</div>
-                        <div style="font-size: 11px; color: #999; margin-top: 5px;">下单时间: ${{new Date(it.createdAt).toLocaleTimeString()}} · 状态: ${{it.statusDesc}}</div>
+                        <span class="history-toggle-action">
+                            <span id="historyToggleText">${{shouldShowHistory ? '收起' : '展开查看'}}</span>
+                            <span id="historyToggleIcon" style="font-size: 10px;">${{shouldShowHistory ? '▲' : '▼'}}</span>
+                        </span>
+                    </div>
+                    <div id="historyOrdersBox" style="display: ${{shouldShowHistory ? 'block' : 'none'}};">
+                        ${{historyOrders.slice(0, 30).map(it => renderOrderCard(it)).join('')}}
                     </div>
                     `;
-                }});
+                }}
+
                 listEl.innerHTML = html;
             }}
         </script>
