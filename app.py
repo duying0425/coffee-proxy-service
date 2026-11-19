@@ -474,34 +474,94 @@ def index_html():
                 width: 100%;
             }}
 
-            .compact-feishu-bar {{
+            .feishu-hero-card {{
+                background: linear-gradient(135deg, #F0F6FF 0%, #E8F2FF 100%);
+                border: 1.5px solid #BFDBFE;
+                border-radius: 14px;
+                padding: 16px 16px 14px 16px;
+                margin-bottom: 14px;
+                box-shadow: 0 4px 14px rgba(51, 112, 255, 0.08);
+                position: relative;
+                overflow: hidden;
+            }}
+            .feishu-hero-card::after {{
+                content: "☕";
+                position: absolute;
+                right: -8px;
+                bottom: -10px;
+                font-size: 72px;
+                opacity: 0.12;
+                pointer-events: none;
+            }}
+            .hero-badge-row {{
                 display: flex;
                 align-items: center;
-                justify-content: space-between;
-                background: #EFF4FF;
-                border: 1px solid #C7D8FF;
-                border-radius: 8px;
-                padding: 7px 12px;
-                margin-bottom: 12px;
-                font-size: 13px;
+                gap: 6px;
+                margin-bottom: 6px;
             }}
-            .compact-feishu-bar .pill-tag {{
+            .hero-badge {{
                 background: var(--feishu-blue);
                 color: #FFF;
                 font-size: 11px;
                 font-weight: 700;
-                padding: 1px 6px;
+                padding: 2px 7px;
                 border-radius: 4px;
-                margin-right: 6px;
+                letter-spacing: 0.5px;
             }}
-            .compact-feishu-bar .pill-link {{
-                color: var(--feishu-blue);
-                text-decoration: none;
+            .hero-sub-tip {{
+                font-size: 12px;
                 font-weight: 600;
+                color: #2563EB;
+            }}
+            .hero-title {{
+                font-size: 15.5px;
+                font-weight: 800;
+                color: #1E293B;
+                margin-bottom: 4px;
+            }}
+            .hero-desc {{
+                font-size: 12.5px;
+                color: #475569;
+                line-height: 1.5;
+                margin-bottom: 12px;
+            }}
+            .hero-btn {{
                 display: flex;
                 align-items: center;
-                gap: 2px;
-                white-space: nowrap;
+                justify-content: center;
+                gap: 6px;
+                background: var(--feishu-blue);
+                color: #FFF;
+                text-decoration: none;
+                padding: 11px 16px;
+                border-radius: 10px;
+                font-size: 14px;
+                font-weight: 700;
+                box-shadow: 0 3px 8px rgba(51, 112, 255, 0.28);
+                transition: all 0.15s ease;
+            }}
+            .hero-btn:active {{
+                background: #255DD9;
+                transform: scale(0.985);
+            }}
+
+            .channel-divider {{
+                display: flex;
+                align-items: center;
+                margin: 14px 4px 12px 4px;
+                color: #94A3B8;
+                font-size: 12px;
+                font-weight: 500;
+            }}
+            .channel-divider::before,
+            .channel-divider::after {{
+                content: "";
+                flex: 1;
+                height: 1px;
+                background: #E2E8F0;
+            }}
+            .channel-divider span {{
+                padding: 0 10px;
             }}
 
             .brand-header {{
@@ -815,32 +875,42 @@ def index_html():
     </head>
     <body>
         <div class="container">
-            <div class="compact-feishu-bar">
-                <div>
-                    <span class="pill-tag">飞书实名</span>
-                    <span style="color:#4B5563;">需要出餐飞书私信通知？</span>
-                </div>
-                <a href="{config.FEISHU_FORM_URL}" target="_blank" class="pill-link">
-                    用飞书问卷 &rarr;
-                </a>
-            </div>
-
             <div class="brand-header">
-                <div class="brand-title">☕ R Café 咖啡点单</div>
+                <div class="brand-title">☕ R Café 自助点单</div>
                 {status_tag_html}
             </div>
 
             <div class="nav-tabs">
-                <div class="nav-tab active" id="tabOrder" onclick="switchTab('order')">网页花名点单</div>
+                <div class="nav-tab active" id="tabOrder" onclick="switchTab('order')">自助点单</div>
                 <div class="nav-tab" id="tabStatus" onclick="switchTab('status')">制作进度 / 记录</div>
             </div>
 
             <div id="panelOrder">
+                <!-- 飞书通知优先推荐卡片 -->
+                <div class="feishu-hero-card">
+                    <div class="hero-badge-row">
+                        <span class="hero-badge">🔔 首选推荐</span>
+                        <span class="hero-sub-tip">咖啡做好 飞书弹窗私聊提醒</span>
+                    </div>
+                    <div class="hero-title">用飞书问卷点单</div>
+                    <div class="hero-desc">
+                        制作完成自动发送飞书私信通知，附带专属取餐码，免盯网页不漏取
+                    </div>
+                    <a href="{config.FEISHU_FORM_URL}" target="_blank" class="hero-btn">
+                        <span>👉 前往飞书问卷点单 (享出餐私信通知)</span>
+                        <span>&rarr;</span>
+                    </a>
+                </div>
+
+                <div class="channel-divider">
+                    <span>或在下方网页直接点单（仅网页查看进度）</span>
+                </div>
+
                 <div class="card">
                     <div class="form-item">
-                        <label class="form-label">您的花名 / 昵称 <span style="color:#E5484D">*</span></label>
+                        <label class="form-label">点单署名 / 昵称 <span style="color:#E5484D">*</span></label>
                         <input type="text" id="userName" placeholder="将打印在咖啡杯贴备注上" required autocomplete="off">
-                        <div class="form-tip">网页点单需在网页查看出餐状态，若需飞书私信请点上方“用飞书问卷”</div>
+                        <div class="form-tip">网页点单需在网页「制作进度」查看出餐状态，无飞书弹窗提醒</div>
                     </div>
 
                     <div class="form-item">
